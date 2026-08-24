@@ -190,14 +190,23 @@ type FeedResult<T> = Result<T, String>;
 // supplemental feed must contribute at least one record.
 const MIN_OSSF_PACKAGES: usize = 100;
 const MIN_DATADOG_PACKAGES: usize = 100;
-const MIN_FEODO_IPS: usize = 10;
+// abuse.ch Feodo Tracker has listed exactly 5 C2 IPs since its 2026-03-04
+// update, and the 2026-08-12 production build shipped those 5. A floor of 10
+// therefore rejects the real feed outright; require a non-empty feed instead,
+// which still fails an empty or comment-only fetch.
+const MIN_FEODO_IPS: usize = 1;
 const MIN_CISA_KEV_RECORDS: usize = 100;
 const MIN_TYPOSQUAT_RECORDS: usize = 100;
 const MAX_BASELINE_DROP_PERCENT: u64 = 50;
 const MAX_OSV_VALUE_BYTES: usize = 256;
 const MAX_BOUNDED_PACKAGE_REQUESTS: usize = 1_000;
-const MAX_REGISTRY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_REGISTRY_AGGREGATE_BYTES: usize = 64 * 1024 * 1024;
+// The pinned bounded set includes @solana/web3.js metadata at 11,975,695
+// uncompressed bytes. Keep a finite per-package ceiling above that reviewed
+// response while the aggregate cap still bounds the complete transaction.
+const MAX_REGISTRY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+// The reviewed 142-package snapshot totals 92,111,058 response bytes. Keep a
+// bounded 128 MiB transaction ceiling rather than the obsolete 64 MiB limit.
+const MAX_REGISTRY_AGGREGATE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_REGISTRY_VERSIONS_PER_PACKAGE: usize = 20_000;
 const MAX_SOURCE_PROVENANCE_BYTES: usize = 1024 * 1024;
 
@@ -411,7 +420,7 @@ struct OsvDatabaseSpecific {
     #[serde(default)]
     iocs: Option<OsvIocs>,
     #[serde(default, rename = "malicious-packages-origins")]
-    malicious_packages_origins: Vec<OsvOrigin>,
+    malicious_packages_origins: Option<Vec<OsvOrigin>>,
 }
 
 /// Indicators of compromise carried at the entry level by current records.
@@ -496,7 +505,7 @@ impl OssfIndicators {
         let Some(ds) = ds else {
             return out;
         };
-        for origin in &ds.malicious_packages_origins {
+        for origin in ds.malicious_packages_origins.as_deref().unwrap_or_default() {
             if let Some(sha) = &origin.sha256 {
                 // Only accept a real 64-char hex SHA-256: a malformed value would
                 // poison the artifact-hash index DB-B builds from these indicators.
@@ -586,6 +595,9 @@ struct OssfStats {
     parsed_packages: usize,
     direct_whole_package_claims: usize,
     bounded_intervals_materialized: usize,
+    empty_registry_intervals_projected: usize,
+    open_ended_boundaries_emitted: usize,
+    registry_not_found_whole_claims: usize,
     exact_versions_emitted: usize,
     unsupported_confirmed_shapes: usize,
     snapshot_failures: usize,
@@ -621,7 +633,10 @@ struct OsvInterval {
 enum RangeProjection {
     None,
     WholePackage,
-    Bounded(Vec<OsvInterval>),
+    Bounded {
+        intervals: Vec<OsvInterval>,
+        open_boundaries: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -633,8 +648,14 @@ struct PendingOssfClaim {
     reference: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+enum RegistryVersionSet {
+    Versions(Vec<String>),
+    PackageNotFound,
+}
+
 trait RegistryVersionProvider {
-    fn versions_for(&mut self, key: &RegistryPackageKey) -> FeedResult<Vec<String>>;
+    fn versions_for(&mut self, key: &RegistryPackageKey) -> FeedResult<RegistryVersionSet>;
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -652,14 +673,30 @@ struct RegistrySnapshotPackage {
     ecosystem: String,
     name: String,
     source_url: String,
+    #[serde(default = "registry_http_ok")]
+    http_status: u16,
+    #[serde(default)]
+    resolution: RegistrySnapshotResolution,
     response_sha256: String,
     response_bytes: usize,
     versions: Vec<String>,
 }
 
+fn registry_http_ok() -> u16 {
+    200
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RegistrySnapshotResolution {
+    #[default]
+    RegistryVersions,
+    PackageNotFound,
+}
+
 #[derive(Debug)]
 struct RegistrySnapshotStore {
-    packages: BTreeMap<RegistryPackageKey, Vec<String>>,
+    packages: BTreeMap<RegistryPackageKey, RegistryVersionSet>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -818,15 +855,16 @@ fn canonical_source_summary(
     if relative_paths.is_empty() {
         return Err("source summary has no files".to_string());
     }
-    let mut paths = relative_paths.to_vec();
-    paths.sort();
-    paths.dedup();
-    if paths.len() != relative_paths.len() {
-        return Err("source summary contains duplicate paths".to_string());
-    }
-    let mut digest = Sha256::new();
-    let mut total_bytes = 0usize;
-    for relative in &paths {
+    // The fetch script digests `find … -print0 | LC_ALL=C sort -z`, i.e. the
+    // NUL-delimited relative path BYTES in ascending order. `PathBuf`'s `Ord`
+    // is component-wise instead: it places `osv/pkg/…` before `osv/pkg-x/…`,
+    // whereas a byte sort places `osv/pkg-x/…` first because '-' (0x2d) sorts
+    // below '/' (0x2f). A 100-file fixture never hits that; the 235k-file
+    // OpenSSF tree hits it constantly, and the two digests then disagree and
+    // fail publication. Sort the normalized string form so both sides of the
+    // provenance binding order any tree identically.
+    let mut entries = Vec::with_capacity(relative_paths.len());
+    for relative in relative_paths {
         if relative.is_absolute()
             || relative
                 .components()
@@ -841,6 +879,16 @@ fn canonical_source_summary(
             .to_str()
             .ok_or_else(|| format!("source summary path {} is not UTF-8", relative.display()))?
             .replace('\\', "/");
+        entries.push((normalized, relative.clone()));
+    }
+    entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    entries.dedup_by(|left, right| left.0 == right.0);
+    if entries.len() != relative_paths.len() {
+        return Err("source summary contains duplicate paths".to_string());
+    }
+    let mut digest = Sha256::new();
+    let mut total_bytes = 0usize;
+    for (normalized, relative) in &entries {
         let path = root.join(relative);
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|error| format!("cannot inspect source input {}: {error}", path.display()))?;
@@ -861,7 +909,7 @@ fn canonical_source_summary(
         digest.update([0]);
     }
     Ok(CanonicalSourceSummary {
-        files: paths.len(),
+        files: entries.len(),
         bytes: total_bytes,
         content_sha256: format!("{:x}", digest.finalize()),
     })
@@ -1297,8 +1345,6 @@ impl RegistrySnapshotStore {
                 &format!("registry response SHA-256 for {}", key.name),
             )?;
             if package.response_bytes > MAX_REGISTRY_RESPONSE_BYTES
-                || package.response_bytes == 0
-                || package.versions.is_empty()
                 || package.versions.len() > MAX_REGISTRY_VERSIONS_PER_PACKAGE
             {
                 return Err(format!(
@@ -1307,6 +1353,29 @@ impl RegistrySnapshotStore {
                 ));
             }
             let versions = package.versions;
+            let version_set = match package.resolution {
+                RegistrySnapshotResolution::RegistryVersions => {
+                    if package.http_status != 200
+                        || package.response_bytes == 0
+                        || versions.is_empty()
+                    {
+                        return Err(format!(
+                            "registry snapshot entry for {} has inconsistent available-package metadata",
+                            key.name
+                        ));
+                    }
+                    RegistryVersionSet::Versions(versions.clone())
+                }
+                RegistrySnapshotResolution::PackageNotFound => {
+                    if package.http_status != 404 || !versions.is_empty() {
+                        return Err(format!(
+                            "registry snapshot entry for {} has inconsistent not-found metadata",
+                            key.name
+                        ));
+                    }
+                    RegistryVersionSet::PackageNotFound
+                }
+            };
             for version in &versions {
                 validate_osv_value(version, "registry version")?;
             }
@@ -1316,7 +1385,7 @@ impl RegistrySnapshotStore {
                     key.name
                 ));
             }
-            if packages.insert(key.clone(), versions).is_some() {
+            if packages.insert(key.clone(), version_set).is_some() {
                 return Err(format!(
                     "duplicate registry snapshot entry for {}",
                     key.name
@@ -1339,7 +1408,7 @@ impl RegistrySnapshotStore {
 }
 
 impl RegistryVersionProvider for RegistrySnapshotStore {
-    fn versions_for(&mut self, key: &RegistryPackageKey) -> FeedResult<Vec<String>> {
+    fn versions_for(&mut self, key: &RegistryPackageKey) -> FeedResult<RegistryVersionSet> {
         self.packages.remove(key).ok_or_else(|| {
             format!(
                 "registry snapshot is missing {}:{}",
@@ -1368,6 +1437,8 @@ fn parse_range_projection(
         return Ok(RangeProjection::None);
     }
     let mut intervals = Vec::new();
+    let mut open_boundaries = Vec::new();
+    let mut whole_package = false;
     for range in ranges {
         if !range.extra.is_empty() {
             return Err(format!(
@@ -1376,7 +1447,13 @@ fn parse_range_projection(
                 range.extra.keys().collect::<Vec<_>>()
             ));
         }
-        if range.range_type != "ECOSYSTEM" {
+        let supported_range_type = range.range_type == "ECOSYSTEM"
+            || (range.range_type == "SEMVER"
+                && matches!(
+                    ecosystem,
+                    Ecosystem::Npm | Ecosystem::Crates | Ecosystem::Go
+                ));
+        if !supported_range_type {
             return Err(format!(
                 "{} uses unsupported confirmed OSV range type {:?}",
                 path.display(),
@@ -1446,16 +1523,17 @@ fn parse_range_projection(
             });
         }
         if let Some(introduced) = open {
-            if introduced != "0" {
-                return Err(format!(
-                    "{} has an unrepresentable non-zero open-ended confirmed interval",
-                    path.display()
-                ));
+            if introduced == "0" {
+                whole_package = true;
+            } else {
+                // The signed database has no open-ended range encoding. Emit the
+                // validated introduced boundary as an exact known-bad version;
+                // do not silently broaden it into a whole-package claim. Closed
+                // siblings are still materialized from the audited registry
+                // snapshot below.
+                compare_versions(ecosystem, &introduced, &introduced)?;
+                open_boundaries.push(introduced);
             }
-            intervals.push(OsvInterval {
-                introduced,
-                end: None,
-            });
         }
     }
     // A package-wide interval changes only the aggregate projection. It must
@@ -1464,16 +1542,16 @@ fn parse_range_projection(
     for interval in &intervals {
         validate_interval_order(ecosystem, interval)?;
     }
-    if intervals
-        .iter()
-        .any(|interval| interval.introduced == "0" && interval.end.is_none())
-    {
+    if whole_package {
         return Ok(RangeProjection::WholePackage);
     }
-    if intervals.is_empty() {
+    if intervals.is_empty() && open_boundaries.is_empty() {
         return Err(format!("{} produced no OSV intervals", path.display()));
     }
-    Ok(RangeProjection::Bounded(intervals))
+    Ok(RangeProjection::Bounded {
+        intervals,
+        open_boundaries,
+    })
 }
 
 fn collect_ossf(
@@ -1490,12 +1568,31 @@ fn collect_ossf(
         return Err(format!("root {} is not a directory", root.display()));
     }
 
+    // A repository checkout contains active, withdrawn, and intentionally
+    // unmergeable OSV trees. Only `osv/malicious` is an active package feed;
+    // parsing the sibling quarantine/archive trees can turn known-invalid or
+    // retired records into publication blockers. Unit fixtures retain the
+    // historical direct-root layout.
+    let osv_root = root.join("osv");
+    let records_root = if osv_root.exists() {
+        let malicious_root = osv_root.join("malicious");
+        if !malicious_root.is_dir() {
+            return Err(format!(
+                "OpenSSF source {} is missing the active osv/malicious tree",
+                root.display()
+            ));
+        }
+        malicious_root
+    } else {
+        root.to_path_buf()
+    };
+
     let mut entries = Vec::new();
     let mut pending = Vec::new();
     let mut all_indicators = OssfIndicators::default();
     let mut stats = OssfStats::default();
     let mut paths = Vec::new();
-    for entry in walkdir::WalkDir::new(root) {
+    for entry in walkdir::WalkDir::new(&records_root) {
         let entry = entry.map_err(|e| format!("root traversal failed: {e}"))?;
         if entry.path().extension().is_some_and(|ext| ext == "json")
             && entry.file_type().is_file()
@@ -1575,12 +1672,25 @@ fn collect_ossf(
         let reference = osv.references.first().map(|record| record.url.clone());
 
         for affected in &osv.affected {
-            let package = affected.package.as_ref().ok_or_else(|| {
-                format!(
+            let Some(package) = affected.package.as_ref() else {
+                // OSV GIT ranges identify repositories/commits rather than a
+                // package ecosystem and cannot enter the package-name index.
+                // Count and exclude that unsupported shape, but retain any
+                // explicit record-level IOCs collected above.
+                if !affected.ranges.is_empty()
+                    && affected
+                        .ranges
+                        .iter()
+                        .all(|range| range.range_type == "GIT")
+                {
+                    stats.skipped_unknown_ecosystem += 1;
+                    continue;
+                }
+                return Err(format!(
                     "{} has an affected record without a package",
                     path.display()
-                )
-            })?;
+                ));
+            };
             if package.ecosystem.trim().is_empty() || package.name.trim().is_empty() {
                 return Err(format!(
                     "{} has an affected package with an empty ecosystem or name",
@@ -1588,11 +1698,8 @@ fn collect_ossf(
                 ));
             }
             let Some(ecosystem) = Ecosystem::from_name(&package.ecosystem) else {
-                return Err(format!(
-                    "unsupported_confirmed_shapes=1: {} has unsupported confirmed ecosystem {:?}",
-                    path.display(),
-                    package.ecosystem
-                ));
+                stats.skipped_unknown_ecosystem += 1;
+                continue;
             };
             let key = RegistryPackageKey {
                 ecosystem,
@@ -1621,13 +1728,35 @@ fn collect_ossf(
                         reference: reference.clone(),
                     });
                 }
-                RangeProjection::Bounded(intervals) => pending.push(PendingOssfClaim {
-                    key,
-                    explicit_versions,
+                RangeProjection::Bounded {
                     intervals,
-                    confidence,
-                    reference: reference.clone(),
-                }),
+                    open_boundaries,
+                } => {
+                    stats.open_ended_boundaries_emitted += open_boundaries.len();
+                    explicit_versions.extend(open_boundaries);
+                    explicit_versions.sort();
+                    explicit_versions.dedup();
+                    if intervals.is_empty() {
+                        stats.exact_versions_emitted += explicit_versions.len();
+                        entries.push(PackageEntry {
+                            ecosystem,
+                            name: key.name,
+                            affected_versions: explicit_versions,
+                            all_versions_malicious: false,
+                            source: ThreatSource::OssfMalicious,
+                            confidence,
+                            reference: reference.clone(),
+                        });
+                    } else {
+                        pending.push(PendingOssfClaim {
+                            key,
+                            explicit_versions,
+                            intervals,
+                            confidence,
+                            reference: reference.clone(),
+                        });
+                    }
+                }
                 RangeProjection::None if !explicit_versions.is_empty() => {
                     stats.exact_versions_emitted += explicit_versions.len();
                     entries.push(PackageEntry {
@@ -1753,8 +1882,8 @@ fn parse_ossf_with_provider(
             })?
             .versions_for(&key);
         match result {
-            Ok(versions) => {
-                universes.insert(key, versions);
+            Ok(version_set) => {
+                universes.insert(key, version_set);
             }
             Err(error) => {
                 return Err(format!("snapshot_failures=1: {error}"));
@@ -1763,12 +1892,35 @@ fn parse_ossf_with_provider(
     }
 
     for claim in pending {
-        let versions = universes.get(&claim.key).ok_or_else(|| {
+        let version_set = universes.get(&claim.key).ok_or_else(|| {
             format!(
                 "registry snapshot missing materialization key {}",
                 claim.key.name
             )
         })?;
+        if matches!(version_set, RegistryVersionSet::PackageNotFound) {
+            // The exact registry endpoint returned a provenance-bound 404.
+            // With no available universe from which to enumerate a bounded
+            // interval, preserve protection by blocking this confirmed
+            // malicious package identity as a whole. This can only broaden a
+            // package that is absent at snapshot time; a future publication
+            // will reevaluate it if the name reappears.
+            stats.registry_not_found_whole_claims += 1;
+            stats.exact_versions_emitted += claim.explicit_versions.len();
+            entries.push(PackageEntry {
+                ecosystem: claim.key.ecosystem,
+                name: claim.key.name,
+                affected_versions: claim.explicit_versions,
+                all_versions_malicious: true,
+                source: ThreatSource::OssfMalicious,
+                confidence: claim.confidence,
+                reference: claim.reference,
+            });
+            continue;
+        }
+        let RegistryVersionSet::Versions(versions) = version_set else {
+            unreachable!("package-not-found registry snapshots return above")
+        };
         let mut affected = claim.explicit_versions;
         for interval in &claim.intervals {
             validate_interval_order(claim.key.ecosystem, interval)?;
@@ -1780,10 +1932,28 @@ fn parse_ossf_with_provider(
                 }
             }
             if interval_matches == 0 {
-                return Err(format!(
-                    "bounded interval for {}:{} materialized to no registry versions",
-                    claim.key.ecosystem, claim.key.name
-                ));
+                // Registries can omit versions after an incident (for example,
+                // npm unpublishes). Preserve the exact source claim without
+                // turning the package into a false whole-package block: an
+                // introduced boundary is affected, and a `last_affected` close
+                // is affected as well. `fixed`/`limit` closes are excluded by
+                // OSV semantics and must never be emitted as malicious.
+                let mut projected_boundary = false;
+                if interval.introduced != "0" {
+                    affected.push(interval.introduced.clone());
+                    projected_boundary = true;
+                }
+                if let Some((RangeEndKind::LastAffected, end)) = &interval.end {
+                    affected.push(end.clone());
+                    projected_boundary = true;
+                }
+                if !projected_boundary {
+                    return Err(format!(
+                        "bounded interval for {}:{} has no registry versions or exact affected boundary",
+                        claim.key.ecosystem, claim.key.name
+                    ));
+                }
+                stats.empty_registry_intervals_projected += 1;
             }
         }
         affected.sort();
@@ -3702,7 +3872,8 @@ fn fetch_registry_snapshots(root: &Path, ossf_commit: &str, output: &Path) -> Fe
         let response = client.get(url.clone()).send().map_err(|error| {
             format!("registry snapshot request for {} failed: {error}", key.name)
         })?;
-        if !response.status().is_success() {
+        let http_status = response.status().as_u16();
+        if http_status != 200 && http_status != 404 {
             return Err(format!(
                 "registry snapshot request for {} returned {}",
                 key.name,
@@ -3729,11 +3900,20 @@ fn fetch_registry_snapshots(root: &Path, ossf_commit: &str, output: &Path) -> Fe
         if aggregate_bytes > MAX_REGISTRY_AGGREGATE_BYTES {
             return Err("registry responses exceed aggregate byte cap".to_string());
         }
-        let versions = extract_registry_versions(&key, &bytes)?;
+        let (resolution, versions) = if http_status == 404 {
+            (RegistrySnapshotResolution::PackageNotFound, Vec::new())
+        } else {
+            (
+                RegistrySnapshotResolution::RegistryVersions,
+                extract_registry_versions(&key, &bytes)?,
+            )
+        };
         packages.push(RegistrySnapshotPackage {
             ecosystem: key.ecosystem.to_string(),
             name: key.name,
             source_url: url.to_string(),
+            http_status,
+            resolution,
             response_sha256: format!("{:x}", Sha256::digest(&bytes)),
             response_bytes: bytes.len(),
             versions,
@@ -3891,12 +4071,15 @@ fn main() {
             require_minimum("OSSF", unique_packages, MIN_OSSF_PACKAGES),
         );
         eprintln!(
-            "    {} entries scanned, {} unique packages ({} parsed claims), {} whole-package claims, {} bounded intervals, {} exact versions, {} withdrawn, {} non-malicious, {} unknown ecosystem, {} unsupported shapes, {} snapshot failures",
+            "    {} entries scanned, {} unique packages ({} parsed claims), {} whole-package claims, {} bounded intervals, {} empty-registry intervals projected exactly, {} open boundaries emitted exactly, {} registry-404 whole-package fallbacks, {} exact versions, {} withdrawn, {} non-malicious, {} unknown ecosystem, {} unsupported shapes, {} snapshot failures",
             stats.total_entries,
             unique_packages,
             stats.parsed_packages,
             stats.direct_whole_package_claims,
             stats.bounded_intervals_materialized,
+            stats.empty_registry_intervals_projected,
+            stats.open_ended_boundaries_emitted,
+            stats.registry_not_found_whole_claims,
             stats.exact_versions_emitted,
             stats.skipped_withdrawn,
             stats.skipped_non_malicious,
@@ -4329,6 +4512,18 @@ fn main() {
                     ossf_stats.bounded_intervals_materialized,
                 ),
                 (
+                    "empty_registry_intervals_projected".to_string(),
+                    ossf_stats.empty_registry_intervals_projected,
+                ),
+                (
+                    "open_ended_boundaries_emitted".to_string(),
+                    ossf_stats.open_ended_boundaries_emitted,
+                ),
+                (
+                    "registry_not_found_whole_claims".to_string(),
+                    ossf_stats.registry_not_found_whole_claims,
+                ),
+                (
                     "exact_versions_emitted".to_string(),
                     ossf_stats.exact_versions_emitted,
                 ),
@@ -4336,6 +4531,10 @@ fn main() {
                 (
                     "non_malicious".to_string(),
                     ossf_stats.skipped_non_malicious,
+                ),
+                (
+                    "unknown_ecosystem".to_string(),
+                    ossf_stats.skipped_unknown_ecosystem,
                 ),
                 (
                     "unsupported_confirmed_shapes".to_string(),
@@ -4802,14 +5001,19 @@ mod tests {
     struct SpyRegistryVersions {
         calls: Vec<RegistryPackageKey>,
         versions: BTreeMap<RegistryPackageKey, Vec<String>>,
+        not_found: BTreeSet<RegistryPackageKey>,
     }
 
     impl RegistryVersionProvider for SpyRegistryVersions {
-        fn versions_for(&mut self, key: &RegistryPackageKey) -> FeedResult<Vec<String>> {
+        fn versions_for(&mut self, key: &RegistryPackageKey) -> FeedResult<RegistryVersionSet> {
             self.calls.push(key.clone());
+            if self.not_found.contains(key) {
+                return Ok(RegistryVersionSet::PackageNotFound);
+            }
             self.versions
                 .get(key)
                 .cloned()
+                .map(RegistryVersionSet::Versions)
                 .ok_or_else(|| format!("missing spy universe for {}", key.name))
         }
     }
@@ -5157,6 +5361,69 @@ mod tests {
     const C01_REGISTRY_VERSIONS: &str =
         include_str!("fixtures/threatdb-c01/registry-versions.json");
 
+    #[test]
+    fn canonical_source_summary_orders_paths_by_bytes_like_the_fetch_script() {
+        // `find -print0 | LC_ALL=C sort -z` orders whole relative paths by
+        // bytes, so `osv/pkg-x/…` and `osv/pkg.x/…` sort BEFORE `osv/pkg/…`
+        // ('-' and '.' are below '/'), and `osv/pkg0/…` after it. Component
+        // ordering puts `osv/pkg/…` first and produces a different digest.
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let files = [
+            ("osv/pkg/MAL-2099-0001.json", "a"),
+            ("osv/pkg-x/MAL-2099-0002.json", "b"),
+            ("osv/pkg.x/MAL-2099-0003.json", "c"),
+            ("osv/pkg0/MAL-2099-0004.json", "d"),
+        ];
+        for (relative, content) in files {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content).unwrap();
+        }
+
+        // Independent replica of the shell pipeline's digest.
+        let mut byte_sorted: Vec<&str> = files.iter().map(|(relative, _)| *relative).collect();
+        byte_sorted.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        assert_eq!(
+            byte_sorted,
+            [
+                "osv/pkg-x/MAL-2099-0002.json",
+                "osv/pkg.x/MAL-2099-0003.json",
+                "osv/pkg/MAL-2099-0001.json",
+                "osv/pkg0/MAL-2099-0004.json",
+            ]
+        );
+        let mut expected = Sha256::new();
+        for relative in &byte_sorted {
+            expected.update(relative.as_bytes());
+            expected.update([0]);
+            expected.update(sha256_hex(&std::fs::read(root.join(relative)).unwrap()).as_bytes());
+            expected.update([0]);
+        }
+        let expected = format!("{:x}", expected.finalize());
+
+        // The fixture must actually exercise the divergence.
+        let mut component_sorted: Vec<PathBuf> = files
+            .iter()
+            .map(|(relative, _)| PathBuf::from(relative))
+            .collect();
+        component_sorted.sort();
+        assert_ne!(
+            component_sorted
+                .iter()
+                .map(|path| path.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            byte_sorted
+        );
+
+        let summary =
+            canonical_source_summary(root, &collect_tree_source_paths(root, "osv").unwrap())
+                .unwrap();
+        assert_eq!(summary.files, 4);
+        assert_eq!(summary.bytes, 4);
+        assert_eq!(summary.content_sha256, expected);
+    }
+
     fn fixture_snapshot_binding(snapshot_path: &Path) -> SourceTransactionBinding {
         let bytes = std::fs::read(snapshot_path).unwrap();
         let document: RegistrySnapshotDocument = serde_json::from_slice(&bytes).unwrap();
@@ -5248,6 +5515,14 @@ mod tests {
     }
 
     #[test]
+    fn nullable_ossf_origins_are_treated_as_no_indicators() {
+        let database_specific: OsvDatabaseSpecific =
+            serde_json::from_str(r#"{"malicious-packages-origins":null}"#).unwrap();
+        let indicators = OssfIndicators::from_database_specific(Some(&database_specific));
+        assert!(indicators.is_empty());
+    }
+
+    #[test]
     fn whole_package_range_bypasses_registry_provider() {
         let directory = tempfile::tempdir().unwrap();
         write_mal(directory.path(), "MAL-2099-0001.json", C01_WHOLE_PACKAGE);
@@ -5259,6 +5534,195 @@ mod tests {
         assert_eq!(stats.bounded_intervals_materialized, 0);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].all_versions_malicious);
+    }
+
+    #[test]
+    fn standard_semver_whole_package_ranges_need_no_registry_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        for (index, ecosystem) in [(20, "npm"), (21, "crates.io"), (22, "Go")] {
+            let id = format!("MAL-2099-{index:04}");
+            write_mal(
+                directory.path(),
+                &format!("{id}.json"),
+                &format!(
+                    r#"{{
+                        "id":"{id}",
+                        "affected":[{{
+                            "package":{{"ecosystem":"{ecosystem}","name":"whole-{index}"}},
+                            "ranges":[{{"type":"SEMVER","events":[{{"introduced":"0"}}]}}]
+                        }}]
+                    }}"#
+                ),
+            );
+        }
+        let mut spy = SpyRegistryVersions::default();
+        let (entries, stats, _) =
+            parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+        assert!(spy.calls.is_empty());
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|entry| entry.all_versions_malicious));
+        assert_eq!(stats.direct_whole_package_claims, 3);
+    }
+
+    #[test]
+    fn nonzero_open_range_emits_known_versions_without_broadening() {
+        let directory = tempfile::tempdir().unwrap();
+        write_mal(
+            directory.path(),
+            "MAL-2099-0023.json",
+            r#"{
+                "id":"MAL-2099-0023",
+                "affected":[{
+                    "package":{"ecosystem":"npm","name":"open-package"},
+                    "versions":["1.0.2"],
+                    "ranges":[{"type":"SEMVER","events":[{"introduced":"1.0.1"}]}]
+                }]
+            }"#,
+        );
+        let mut spy = SpyRegistryVersions::default();
+        let (entries, stats, _) =
+            parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+        assert!(
+            spy.calls.is_empty(),
+            "an open tail must not trigger live expansion"
+        );
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].all_versions_malicious);
+        assert_eq!(entries[0].affected_versions, ["1.0.1", "1.0.2"]);
+        assert_eq!(stats.open_ended_boundaries_emitted, 1);
+        assert_eq!(stats.bounded_intervals_materialized, 0);
+    }
+
+    #[test]
+    fn registry_not_found_preserves_a_confirmed_bounded_package_block() {
+        let directory = tempfile::tempdir().unwrap();
+        write_mal(
+            directory.path(),
+            "MAL-2099-0030.json",
+            r#"{
+                "id":"MAL-2099-0030",
+                "affected":[{
+                    "package":{"ecosystem":"npm","name":"removed-package"},
+                    "ranges":[{"type":"SEMVER","events":[
+                        {"introduced":"0"},{"fixed":"2.0.0"}
+                    ]}]
+                }]
+            }"#,
+        );
+        let key = RegistryPackageKey {
+            ecosystem: Ecosystem::Npm,
+            name: "removed-package".to_string(),
+        };
+        let mut spy = SpyRegistryVersions::default();
+        spy.not_found.insert(key.clone());
+
+        let (entries, stats, _) =
+            parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+        assert_eq!(spy.calls, [key]);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].all_versions_malicious);
+        assert_eq!(stats.registry_not_found_whole_claims, 1);
+        assert_eq!(stats.bounded_intervals_materialized, 0);
+    }
+
+    #[test]
+    fn unpublished_interval_uses_only_exact_affected_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        write_mal(
+            directory.path(),
+            "MAL-2099-0031.json",
+            r#"{
+                "id":"MAL-2099-0031",
+                "affected":[{
+                    "package":{"ecosystem":"npm","name":"partly-unpublished"},
+                    "versions":["2.0.22"],
+                    "ranges":[{"type":"SEMVER","events":[
+                        {"introduced":"2.0.27"},{"last_affected":"2.0.28"}
+                    ]}]
+                }]
+            }"#,
+        );
+        let key = RegistryPackageKey {
+            ecosystem: Ecosystem::Npm,
+            name: "partly-unpublished".to_string(),
+        };
+        let mut spy = SpyRegistryVersions::default();
+        spy.versions.insert(
+            key.clone(),
+            vec!["2.0.24".to_string(), "2.0.41".to_string()],
+        );
+
+        let (entries, stats, _) =
+            parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+        assert_eq!(spy.calls, [key]);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].all_versions_malicious);
+        assert_eq!(entries[0].affected_versions, ["2.0.22", "2.0.27", "2.0.28"]);
+        assert_eq!(stats.empty_registry_intervals_projected, 1);
+        assert_eq!(stats.bounded_intervals_materialized, 1);
+    }
+
+    #[test]
+    fn repository_layout_reads_only_the_active_malicious_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let osv = directory.path().join("osv");
+        write_mal(
+            &osv.join("malicious/npm/active"),
+            "MAL-2099-0024.json",
+            r#"{
+                "id":"MAL-2099-0024",
+                "affected":[{"package":{"ecosystem":"npm","name":"active"}}]
+            }"#,
+        );
+        write_mal(
+            &osv.join("unmergable/npm/quarantined"),
+            "MAL-2099-0025.json",
+            r#"{"id":"MAL-WRONG","affected":[]}"#,
+        );
+        write_mal(
+            &osv.join("withdrawn/npm/retired"),
+            "MAL-2099-0026.json",
+            "{not json",
+        );
+
+        let (entries, stats, _) = parse_ossf(directory.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "active");
+        assert_eq!(stats.total_entries, 1);
+    }
+
+    #[test]
+    fn unsupported_package_ecosystems_are_counted_and_excluded() {
+        let directory = tempfile::tempdir().unwrap();
+        write_mal(
+            directory.path(),
+            "MAL-2099-0027.json",
+            r#"{
+                "id":"MAL-2099-0027",
+                "affected":[{"package":{"ecosystem":"npm","name":"supported"}}]
+            }"#,
+        );
+        write_mal(
+            directory.path(),
+            "MAL-2099-0028.json",
+            r#"{
+                "id":"MAL-2099-0028",
+                "affected":[{"package":{"ecosystem":"VSCode","name":"unsupported.extension"}}]
+            }"#,
+        );
+        write_mal(
+            directory.path(),
+            "MAL-2099-0029.json",
+            r#"{
+                "id":"MAL-2099-0029",
+                "affected":[{"ranges":[{"type":"GIT","repo":"https://example.invalid/repo.git","events":[{"introduced":"0"}]}]}]
+            }"#,
+        );
+
+        let (entries, stats, _) = parse_ossf(directory.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "supported");
+        assert_eq!(stats.skipped_unknown_ecosystem, 2);
     }
 
     #[test]
@@ -5449,7 +5913,6 @@ mod tests {
     #[test]
     fn confirmed_unrepresentable_range_shapes_fail_publication() {
         for events_or_range in [
-            r#"{"type":"ECOSYSTEM","events":[{"introduced":"1.0.0"}]}"#,
             r#"{"type":"GIT","events":[{"introduced":"0"},{"fixed":"abc"}]}"#,
             r#"{"type":"ECOSYSTEM","events":[{"fixed":"1.0.0"}]}"#,
             r#"{"type":"ECOSYSTEM","events":[{"introduced":"0","fixed":"1.0.0"}]}"#,
@@ -5645,7 +6108,35 @@ mod tests {
         let binding = fixture_snapshot_binding(&snapshot_path);
         assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
             .unwrap_err()
-            .contains("outside caps"));
+            .contains("inconsistent available-package metadata"));
+    }
+
+    #[test]
+    fn registry_snapshot_authenticates_package_not_found_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot_path = directory.path().join("registry-versions.json");
+        let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
+        document["packages"][0]["resolution"] = serde_json::json!("package_not_found");
+        document["packages"][0]["http_status"] = serde_json::json!(404);
+        document["packages"][0]["versions"] = serde_json::json!([]);
+        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        let mut store = RegistrySnapshotStore::load(&snapshot_path, &binding).unwrap();
+        let key = RegistryPackageKey {
+            ecosystem: Ecosystem::Npm,
+            name: "@solana/web3.js".to_string(),
+        };
+        assert!(matches!(
+            store.versions_for(&key).unwrap(),
+            RegistryVersionSet::PackageNotFound
+        ));
+
+        document["packages"][0]["http_status"] = serde_json::json!(200);
+        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
+            .unwrap_err()
+            .contains("inconsistent not-found metadata"));
     }
 
     #[test]
