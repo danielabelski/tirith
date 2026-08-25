@@ -419,7 +419,7 @@ documented native authority, a newly dedicated target directory, and an
 enrolled fully static native `uv`. Every unsupported platform fails closed
 before pip starts; it never falls back to an ordinary install. npm and Cargo
 remain non-enforcing evidence surfaces. See the
-[0.4.0 release guide](docs/release-notes-0.4.0.md) and
+[0.4.0 release notes](docs/release-notes-0.4.0.md) and
 [command reference](docs/commands.md).
 
 **Attack families tirith is built for** (illustrative, not a caught-by-current-code claim):
@@ -822,7 +822,7 @@ plugins=(... tirith)
 
 Use `tirith setup <tool>` for one-command configuration. This is the complete
 named setup surface, including both the earlier integrations and the additions
-targeted for 0.4.0:
+released in 0.4.0:
 
 | Host | Setup | Protection layer installed by setup | Scope |
 |---|---|---|---|
@@ -1232,7 +1232,7 @@ Disable: `export TIRITH_LOG=0`
 - [Cookbook](docs/cookbook.md), policy examples for common setups
 - [Troubleshooting](docs/troubleshooting.md), shell quirks, latency, false positives
 - [Compatibility](docs/compatibility.md), stable vs experimental surface
-- [Draft 0.4.0 release guide](docs/release-notes-0.4.0.md), release highlights, upgrade notes, limitations, and final gates
+- [0.4.0 release notes](docs/release-notes-0.4.0.md), release highlights, upgrade notes, limitations, and publication contract
 - [Release checklist](docs/release-checklist.md), protected publication sequence and registry verification
 - [Security policy](SECURITY.md), vulnerability reporting
 - [Uninstall](docs/uninstall.md), clean removal per shell and package manager

@@ -1,9 +1,8 @@
 # Compatibility and Stability
 
-This matrix describes the current 0.4.0 integration tree. Until 0.4.0 is
-tagged, the latest published package may expose a smaller surface. The
-[draft release guide](release-notes-0.4.0.md) separates target capabilities
-from released artifacts.
+This matrix describes Tirith 0.4.0. The
+[0.4.0 release notes](release-notes-0.4.0.md) summarize the published
+capabilities, compatibility boundaries, and remaining limitations.
 
 ## Stability Tiers
 

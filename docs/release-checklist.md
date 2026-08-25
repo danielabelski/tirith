@@ -1,10 +1,10 @@
 # Release Checklist
 
-## 0.4.0 preparation
+## 0.4.0 release sequence
 
-The current changelog and release guide describe **target** 0.4.0 behavior; the
-package version remains 0.3.3 until the final integration tree is known. Before
-creating the release commit:
+The changelog and release notes describe the final 0.4.0 tree. The workspace
+version stays on the previous release until the integration tree is known, then
+the release commit performs the version and documentation transition below:
 
 1. Rebase or merge the complete integration stack onto the final default-branch
    tip and review the resulting tree, not only each stacked diff.
@@ -17,7 +17,7 @@ creating the release commit:
    every package template is materialized from the tag as designed. Do not
    hand-edit generated capability or evidence files.
 6. Move the changelog content from `[Unreleased]` to
-   `[0.4.0] - YYYY-MM-DD`, remove the draft banner from the release guide, and
+   `[0.4.0] - YYYY-MM-DD`, remove the draft banner from the release notes, and
    ensure README installation text does not claim a registry has 0.4.0 before
    that registry actually does.
 7. Run package assembly and the full release-validation workflow before pushing

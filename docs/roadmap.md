@@ -10,7 +10,7 @@ records what each command inspects and whether policy fully governs that
 surface. It is generated from the versioned
 [`capability-manifest.toml`](capability-manifest.toml) and guarded by a CI test.
 
-## Published: 0.3.3
+## Published foundation: 0.3.3
 
 The latest published release line established the current shell, CLI, policy,
 and threat-intelligence foundation:
@@ -31,10 +31,9 @@ and threat-intelligence foundation:
 See the historical [0.3.3 changelog](../CHANGELOG.md#033---2026-06-19) for the
 exact release contents.
 
-## Merged after 0.3.3
+## Published: 0.4.0
 
-These capabilities are on the default branch but have not yet appeared in a
-new tagged release:
+These capabilities shipped in 0.4.0:
 
 - **Python artifact pipeline:** typed coverage outcomes, byte/magic
   classification, a hardened streaming wheel reader, RECORD/ownership
@@ -55,10 +54,9 @@ new tagged release:
   network/feed/MCP/artifact work, centralized redaction, private audit/receipt
   state, license-event ordering, and immutable release inputs.
 
-## Targeted for 0.4.0
+### Additional 0.4.0 capabilities
 
-These capabilities are present on the current integration stack and are
-planned for 0.4.0 after final integration and release verification:
+The release also includes:
 
 - bounded Web3 command grammar and `web3_guard` policy for Cast, Forge,
   Hardhat, Solana, and Anchor;
@@ -79,23 +77,17 @@ planned for 0.4.0 after final integration and release verification:
 - GLIBC 2.28 Linux release compatibility, canonical Debian/RPM bytes, and
   expanded crates/npm/container/Chocolatey/AUR publication gates.
 
-The [draft 0.4.0 release guide](release-notes-0.4.0.md) is the detailed feature
-and upgrade inventory.
+The [0.4.0 release notes](release-notes-0.4.0.md) are the detailed feature,
+upgrade, compatibility, and limitation inventory.
 
-## Required before tagging 0.4.0
+## 0.4.0 publication contract
 
-- Integrate the entire stack onto the final default-branch tip and review the
-  resulting tree and conflict resolutions.
-- Resolve or explicitly defer every changelog known issue, including the
-  nested-shell, `forge create`, inert Web3 policy, command-card authoring,
-  task-audit, and full/read-only temporary-directory gaps.
-- Run the required Linux, macOS, and Windows matrix on the exact release tree,
-  including native Linux containment and real-host-shaped integration checks.
-- Complete the Web3/task and ThreatDB v2 rollout playbooks.
-- Make the 0.4.0 release commit, package the workspace, and publish only through
-  the protected single-use tag workflow.
-- Verify every public registry and artifact after publication. Chocolatey and
-  Homebrew core may lag the GitHub release and must be described honestly.
+0.4.0 is cut only from the final default-branch tree after the cross-platform
+and package-assembly gates pass on that exact commit. Its known issues are
+explicitly deferred in the changelog, and publication uses the protected,
+single-use tag workflow. Registry state is verified independently after the
+workflow completes; Chocolatey moderation and Homebrew core bottle publication
+may lag and are reported separately.
 
 ## Later
 
