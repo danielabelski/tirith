@@ -1,10 +1,7 @@
-# Tirith 0.4.0 release guide
+# Tirith 0.4.0 release notes
 
-> **Draft, not a release announcement.** Version 0.4.0 is the target for the
-> changes merged after 0.3.3 plus the current integration stack. Do not describe
-> these capabilities as released until the stack is integrated onto the final
-> default-branch tree, all required release gates pass there, and the 0.4.0 tag
-> and artifacts exist.
+Released 2026-08-25. This release integrates the work merged after 0.3.3 and
+publishes it through Tirith's protected, single-use release pipeline.
 
 ## Why 0.4.0
 
@@ -177,9 +174,7 @@ times out; run each host's verification step after setup and upgrades.
 
 ## Upgrade and installation
 
-Do not run these as 0.4.0-specific instructions until the 0.4.0 artifacts are
-published. Once released, use the same package manager that owns the current
-installation:
+Use the same package manager that owns the current installation:
 
 ```bash
 brew upgrade tirith
@@ -260,22 +255,11 @@ agent matrix.
 - Host hooks and MCP registrations require effective-host verification; config
   presence alone does not prove that a host loaded or honored them.
 
-## Release-owner gates
+## Publication and verification
 
-Before changing `[Unreleased]` to `[0.4.0]`:
-
-1. Integrate the full stack onto the final default-branch tip and review the
-   conflict resolutions and resulting tree.
-2. Close or explicitly defer every item in the changelog's known-issues list.
-3. Run the full required Linux, macOS, and Windows matrices on that exact tree,
-   including host-shaped hook fixtures and native Linux containment tests.
-4. Complete the Web3/task and ThreatDB v2 rollout playbooks.
-5. Set every workspace/package version to `0.4.0`, regenerate locked/generated
-   artifacts, and run package assembly before tagging.
-6. Verify that 0.4.0 is absent from every destination, then publish through the
-   protected tag workflow without replacing any existing artifact.
-7. Verify GitHub assets, signatures, provenance, crates.io, npm, Homebrew,
-   Scoop, GHCR, Chocolatey submission status, and AUR after publication.
-
-The operational sequence and authority requirements live in the
+0.4.0 is published only from the protected `v0.4.0` tag after the Linux,
+macOS, Windows, package-assembly, compatibility, and provenance gates pass on
+the exact tagged tree. The limitations above are the release's explicit
+deferrals. Registry availability, public artifact checksums, signatures,
+provenance, and package-manager state are verified using the
 [release checklist](release-checklist.md).

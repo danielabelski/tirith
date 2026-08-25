@@ -7,11 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-> **Target release: 0.4.0.** This section combines the changes merged after
-> 0.3.3 with the current integration stack. It remains unreleased until that
-> stack is rebased onto the final default-branch tip, the platform matrix and
-> release gates pass on the resulting tree, and the release date is known. See
-> the [draft 0.4.0 release guide](docs/release-notes-0.4.0.md).
+## [0.4.0] - 2026-08-25
 
 ### Added
 
@@ -76,6 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **License and release boundaries:** revocation-like webhook events that cannot be ordered are dead-lettered rather than dropped, dead-letter failures and internal server errors are logged, and an unparseable refresh-token timestamp fails closed. Release actions, images, runners, and package inputs are immutably pinned; validation and publication are separated; crates, npm packages, containers, checksums, signatures, and provenance are treated as single-use release artifacts.
 
 ### Known issues
+
+The following limitations are explicitly deferred from 0.4.0. They remain
+documented release constraints rather than claims of complete enforcement.
 
 - **Broad custom-DLP patterns can rewrite generated machine fields.** Several JSON/MCP projections recursively redact every string value after construction. Keys, booleans, and numbers survive, but generated enum labels, receipt types, content identifiers, hashes, and other protocol-owned strings can match an operator regex and be replaced, producing schema-valid JSON whose semantics or later signature/receipt verification no longer match. Custom DLP needs field classification so only untrusted/sensitive values are mutable.
 - **`tirith install --yes` is an unattended task-policy approval.** At the package-manager execution boundary, an explicit `--yes` mints the typed `unattended_package_manager` approval required by `action_incomplete_analysis: require_approval`; it does not require a TTY or a separate human. Do not use `require_approval` there as a human-in-the-loop guarantee. Use a blocking task policy or omit `--yes` until unattended acknowledgement is separated from policy approval.

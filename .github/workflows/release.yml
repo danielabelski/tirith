@@ -840,10 +840,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          notes_file="docs/release-notes-${GITHUB_REF_NAME#v}.md"
+          if [[ -f "$notes_file" ]]; then
+            notes_args=(--notes-file "$notes_file")
+          else
+            notes_args=(--generate-notes)
+          fi
           gh release create "$GITHUB_REF_NAME" artifacts/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --generate-notes
+            "${notes_args[@]}"
 
   publish-crates:
     name: Publish to crates.io
@@ -1688,7 +1694,6 @@ jobs:
 
       - name: Push to Chocolatey
         shell: pwsh
-        continue-on-error: true  # Chocolatey moderation can block pushes; don't fail the release
         env:
           # Reach the secret through the environment. Interpolating `${{ }}` into
           # a run: body splices the value into the script before the shell sees
@@ -1696,17 +1701,16 @@ jobs:
           # lands in the process command line.
           CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
-          # `continue-on-error` keeps a moderation hold from failing a release,
-          # but it also let the v0.3.3 push fail with a 403 that nobody saw: the
-          # step went red inside a green job and the version never reached
-          # Chocolatey. Every outcome here is therefore written to the run
-          # summary and raised as an annotation, so the job page says what
-          # happened without anyone opening a log.
+          # The v0.3.3 push failed with a 403 that was hidden by
+          # continue-on-error, so Chocolatey authentication/submission failures
+          # now keep the release workflow red and can be retried after the key
+          # or package ownership is fixed. A successful push may still wait for
+          # community moderation; that state is recorded in the run summary.
           $summary = $env:GITHUB_STEP_SUMMARY
           if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
-            Write-Output "::warning title=Chocolatey push skipped::CHOCOLATEY_API_KEY is not configured; the release was not pushed to Chocolatey"
-            Add-Content -Path $summary -Value "## Chocolatey`n`n**Skipped**: CHOCOLATEY_API_KEY is not configured."
-            exit 0
+            Write-Output "::error title=Chocolatey push blocked::CHOCOLATEY_API_KEY is not configured; the release was not pushed to Chocolatey"
+            Add-Content -Path $summary -Value "## Chocolatey`n`n**Blocked**: CHOCOLATEY_API_KEY is not configured."
+            exit 1
           }
           $nupkg = Get-ChildItem -Path ${{ github.workspace }} -Filter "tirith.*.nupkg" | Select-Object -First 1
           if (-not $nupkg) {
@@ -1720,7 +1724,7 @@ jobs:
           if ($code -ne 0) {
             $detail = ($output -split "`n" | Where-Object { $_ -match "status code|forbidden|unauthorized|conflict|moderation|exists" } | Select-Object -First 3) -join "; "
             if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "exit $code" }
-            Write-Output "::error title=Chocolatey push failed::$($nupkg.Name): $detail. A 403 means the API key is invalid or not authorized for this package; a 409 means the version already exists; a moderation hold on the previous version can also refuse a push. The release itself is unaffected."
+            Write-Output "::error title=Chocolatey push failed::$($nupkg.Name): $detail. A 403 means the API key is invalid or not authorized for this package; a 409 means the version already exists; a moderation hold on the previous version can also refuse a push. The release workflow remains failed until submission succeeds."
             Add-Content -Path $summary -Value "## Chocolatey`n`n**Failed** to push ``$($nupkg.Name)``: $detail`n`nThe package must be pushed by hand, or the key rotated, before the next tag. See the step log for the full response."
             exit $code
           }
