@@ -1934,11 +1934,18 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuardEvent {
+    code: libc::c_int,
+    status: libc::c_int,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn wait_for_guard_event(
     guard_pid: u32,
     event: libc::c_int,
     timeout: std::time::Duration,
-) -> Option<libc::c_int> {
+) -> Result<Option<GuardEvent>, String> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -1956,6 +1963,9 @@ fn wait_for_guard_event(
             // our child" — both are ECHILD. Report what the process table says
             // so the failure names which one it is.
             let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             let reachable = unsafe { libc::kill(guard_pid as libc::pid_t, 0) } == 0;
             let stat = std::fs::read_to_string(format!("/proc/{guard_pid}/stat"))
                 .ok()
@@ -1963,22 +1973,19 @@ fn wait_for_guard_event(
                     line.rsplit_once(')')
                         .map(|(_, rest)| rest.split_whitespace().next().unwrap_or("?").to_string())
                 });
-            panic!(
+            return Err(format!(
                 "observe capsule guard without reaping: {error}; guard_pid={guard_pid} \
                  event={event:#x} signal-0-reachable={reachable} proc-state={stat:?}"
-            );
+            ));
         }
-        assert_eq!(
-            result,
-            0,
-            "observe capsule guard without reaping: {}",
-            std::io::Error::last_os_error()
-        );
         if unsafe { info.si_pid() } != 0 {
-            return Some(unsafe { info.si_status() });
+            return Ok(Some(GuardEvent {
+                code: info.si_code,
+                status: unsafe { info.si_status() },
+            }));
         }
         if std::time::Instant::now() >= deadline {
-            return None;
+            return Ok(None);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -2006,7 +2013,7 @@ fn process_group_disappears(group: u32, timeout: std::time::Duration) -> bool {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals() {
+fn capsule_guard_reaps_clone_parent_children_and_contains_fatal_and_stop_signals() {
     use std::io::{BufRead as _, BufReader};
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -2227,63 +2234,51 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
         // delivered. The assertion still fails if the event never arrives.
         const GUARD_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-        // Both arms end in an exit. The guard ABSORBS a signal delivered to
-        // its contained target — fatal or stop, which is what this test's name
-        // says — and reports it as its own exit status, `128 + signal`. Asking
-        // for a STOPPED event instead found the guard already a zombie, whose
-        // only reportable status is "exited", so `waitid` answered ECHILD.
-        let observed = wait_for_guard_event(group, libc::WEXITED, GUARD_EVENT_TIMEOUT);
-        // The guard ABSORBS a fatal signal delivered to its contained target
-        // rather than dying from it: `__capsule-child` translates
-        // `ContainedTargetExit::Signal(signal)` into `exit(128 + signal)`, the
-        // conventional shell encoding. So a SIGKILL surfaces as an EXITED event
-        // carrying 128+9 rather than a KILLED event carrying 9 — which is the
-        // absorption this test exists to verify. A stop arrives as the signal
-        // itself. `waitid` only reports `si_status` as the signal number under
-        // `CLD_KILLED`; under `CLD_EXITED` it is the exit code, so both shapes
-        // are legitimate here and asserting one alone asserts the wrong thing.
-        let absorbed = 128 + attack_signal;
-        // A stopped target is not left hanging: the capsule's own deadline
-        // cleanup SIGKILLs it, and the guard absorbs THAT and exits carrying
-        // `128 + SIGKILL`. The final assertion in this test names the same two
-        // outcomes ("the hostile SIGKILL or the deadline cleanup SIGKILL").
-        let absorbed_cleanup = 128 + libc::SIGKILL;
-        assert!(
-            observed.is_some_and(|status| status == attack_signal
-                || status == absorbed
-                || status == absorbed_cleanup),
-            "clone child must deliver its selected signal to the contained guard: \
-             observed {observed:?}, expected the signal ({attack_signal}) or its \
-             absorbed form ({absorbed})"
+        // CLONE_PARENT makes the clone a direct child of the guard. Linux sends
+        // the clone's low-byte termination signal to that parent, so SIGKILL
+        // must kill the guard and SIGSTOP must stop it. Neither signal can be
+        // caught or translated into an exit code. In particular, accepting 137
+        // here would let the target's unrelated CPU rlimit mask non-delivery.
+        let expected = if attack_signal == libc::SIGKILL {
+            GuardEvent {
+                code: libc::CLD_KILLED,
+                status: libc::SIGKILL,
+            }
+        } else {
+            GuardEvent {
+                code: libc::CLD_STOPPED,
+                status: libc::SIGSTOP,
+            }
+        };
+        let event = if attack_signal == libc::SIGKILL {
+            libc::WEXITED
+        } else {
+            libc::WSTOPPED
+        };
+        let observed = wait_for_guard_event(group, event, GUARD_EVENT_TIMEOUT);
+        let direct_exit_observed = matches!(
+            &observed,
+            Ok(Some(GuardEvent {
+                code: libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED,
+                ..
+            }))
         );
 
         // This is the same safety ordering as the production supervisor: signal
         // the complete group while its direct guard is still unreaped, then reap
         // that leader and require ESRCH before releasing its temporary HOME.
-        let kill_result = unsafe { libc::kill(-(group as libc::pid_t), libc::SIGKILL) };
-        if kill_result != 0 {
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ESRCH),
-                "kill guarded capsule group"
-            );
-        }
-        let status = guard.wait().expect("reap guarded capsule leader");
-        // Same contract as the earlier observation: the guard ABSORBS a fatal
-        // signal delivered to its contained target and reports it as its own
-        // exit status, `128 + signal`. So it may either die by the SIGKILL —
-        // when the group kill reaches it before it has absorbed anything — or
-        // exit carrying the absorbed form. `ExitStatus::signal()` is `None` in
-        // the second case, which is why asserting only the first asserted the
-        // shape the guard is built not to produce.
-        let absorbed_sigkill = 128 + libc::SIGKILL;
-        assert!(
-            status.signal() == Some(libc::SIGKILL) || status.code() == Some(absorbed_sigkill),
-            "guard must die by the hostile SIGKILL or report its absorbed form \
-             ({absorbed_sigkill}); observed signal={:?} code={:?}",
-            status.signal(),
-            status.code()
+        // Cleanup is attempted before validating the receipt so a failed
+        // assertion cannot leak a stopped guard or its spinning target into the
+        // rest of the suite.
+        let cleanup = finish_test_process_group(
+            &mut guard,
+            group as libc::pid_t,
+            direct_exit_observed,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
         );
+        let status = cleanup.unwrap_or_else(|error| {
+            panic!("clean guarded capsule adversary after observation: {error}")
+        });
         assert!(
             process_group_disappears(group, std::time::Duration::from_secs(5)),
             "guarded capsule group {group} retained a member or zombie"
@@ -2305,6 +2300,26 @@ fn capsule_guard_reaps_clone_parent_children_and_absorbs_fatal_and_stop_signals(
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
+        );
+        let observed = observed
+            .unwrap_or_else(|error| panic!("observe selected clone-parent signal: {error}"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "clone child did not deliver signal {attack_signal} to the contained guard \
+                     within {GUARD_EVENT_TIMEOUT:?}"
+                )
+            });
+        assert_eq!(
+            observed, expected,
+            "clone child must deliver its selected signal directly to the contained guard"
+        );
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "guard must die by the hostile SIGKILL or the anchored group cleanup; \
+             observed signal={:?} code={:?}",
+            status.signal(),
+            status.code()
         );
         drop(temp_home);
         assert!(
