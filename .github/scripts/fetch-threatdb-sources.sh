@@ -381,7 +381,7 @@ for package in packages:
         assert status == 200 and package["response_bytes"] > 0 and not versions
     else:
         assert resolution == "package_not_found"
-        assert status == 404 and not versions
+        assert status == 404 and package["response_bytes"] > 0 and not versions
 assert sum(package["response_bytes"] for package in packages) <= 128 * 1024 * 1024
 PY
 

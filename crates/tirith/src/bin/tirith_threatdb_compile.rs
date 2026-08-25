@@ -1404,7 +1404,10 @@ impl RegistrySnapshotStore {
                     RegistryVersionSet::Versions(versions.clone())
                 }
                 RegistrySnapshotResolution::PackageNotFound => {
-                    if package.http_status != 404 || !versions.is_empty() {
+                    if package.http_status != 404
+                        || package.response_bytes == 0
+                        || !versions.is_empty()
+                    {
                         return Err(format!(
                             "registry snapshot entry for {} has inconsistent not-found metadata",
                             key.name
@@ -3881,6 +3884,80 @@ enum RegistryDocument {
     NpmUnpublishedStub,
 }
 
+fn npm_unpublished_stub_is_authentic(
+    key: &RegistryPackageKey,
+    document: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let named_self = document
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| name == key.name);
+    if !named_self {
+        return false;
+    }
+    let registry_timestamp = |value: &serde_json::Value| {
+        value.as_str().is_some_and(|timestamp| {
+            timestamp.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(timestamp).is_ok()
+        })
+    };
+
+    // The abbreviated install-v1 response is exactly
+    // {"name": <requested>, "modified": <RFC3339>}. Requiring the exact key
+    // set prevents a name-bearing error document from becoming an unpublished
+    // classification.
+    let abbreviated = document.len() == 2
+        && document.contains_key("name")
+        && document.get("modified").is_some_and(registry_timestamp);
+    if abbreviated {
+        return true;
+    }
+
+    // npm can ignore the abbreviated Accept value and return the full CouchDB
+    // document. Positively identify that form through its matching identity,
+    // revision, and time.unpublished receipt. A generic object that merely
+    // echoes the requested name is not sufficient.
+    let matching_id = document
+        .get("_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| id == key.name);
+    let has_revision = document
+        .get("_rev")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|revision| validate_osv_value(revision, "npm registry revision").is_ok());
+    let Some(time) = document.get("time").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let Some(unpublished) = time
+        .get("unpublished")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    let modified = time.get("modified");
+    let unpublished_at = unpublished.get("time");
+    let timestamps_match =
+        modified
+            .zip(unpublished_at)
+            .is_some_and(|(modified, unpublished_at)| {
+                modified == unpublished_at
+                    && registry_timestamp(modified)
+                    && registry_timestamp(unpublished_at)
+            });
+    let unpublished_versions = unpublished
+        .get("versions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|versions| {
+            !versions.is_empty()
+                && versions.len() <= MAX_REGISTRY_VERSIONS_PER_PACKAGE
+                && versions.iter().all(|version| {
+                    version.as_str().is_some_and(|version| {
+                        validate_osv_value(version, "unpublished registry version").is_ok()
+                    })
+                })
+        });
+    matching_id && has_revision && timestamps_match && unpublished_versions
+}
+
 fn parse_registry_document(key: &RegistryPackageKey, bytes: &[u8]) -> FeedResult<RegistryDocument> {
     let document: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid registry response for {}: {error}", key.name))?;
@@ -3893,11 +3970,7 @@ fn parse_registry_document(key: &RegistryPackageKey, bytes: &[u8]) -> FeedResult
         .as_object()
         .ok_or_else(|| format!("registry response for {} is not a JSON object", key.name))?;
     let Some(value) = document.get(field) else {
-        let named_self = document
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| name == key.name);
-        if key.ecosystem == Ecosystem::Npm && named_self {
+        if key.ecosystem == Ecosystem::Npm && npm_unpublished_stub_is_authentic(key, document) {
             return Ok(RegistryDocument::NpmUnpublishedStub);
         }
         return Err(format!(
@@ -6172,6 +6245,16 @@ mod tests {
             .unwrap(),
             RegistryDocument::NpmUnpublishedStub
         );
+        // npm's full CouchDB form positively records the unpublished version
+        // and binds the package identity and revision.
+        assert_eq!(
+            parse_registry_document(
+                &key,
+                br#"{"_id":"ab-test-wordpress","name":"ab-test-wordpress","time":{"created":"2025-10-10T10:42:51.227Z","modified":"2025-10-10T10:44:23.849Z","1.18.3":"2025-10-10T10:42:51.509Z","unpublished":{"time":"2025-10-10T10:44:23.849Z","versions":["1.18.3"]}},"_rev":"2-b9dd1da47486cec5bb948497a8f1ba6d"}"#
+            )
+            .unwrap(),
+            RegistryDocument::NpmUnpublishedStub
+        );
         assert_eq!(
             parse_registry_document(&key, br#"{"versions":{"1.0.0":{},"0.9.0":{}}}"#).unwrap(),
             RegistryDocument::Versions(vec!["0.9.0".to_string(), "1.0.0".to_string()])
@@ -6180,7 +6263,13 @@ mod tests {
         for body in [
             br#"{}"#.as_slice(),
             br#"{"error":"internal error"}"#,
+            br#"{"name":"ab-test-wordpress","error":"internal error"}"#,
+            br#"{"name":"ab-test-wordpress","modified":"2025-10-10T10:44:23.849Z","error":"internal error"}"#,
+            br#"{"name":"ab-test-wordpress","modified":"not-a-timestamp"}"#,
             br#"{"name":"some-other-package","modified":"2025-10-10T10:44:23.849Z"}"#,
+            br#"{"_id":"ab-test-wordpress","name":"ab-test-wordpress","time":{"modified":"2025-10-10T10:44:23.849Z","unpublished":{"time":"2025-10-10T10:44:23.849Z","versions":["1.18.3"]}}}"#,
+            br#"{"_id":"ab-test-wordpress","name":"ab-test-wordpress","time":{"modified":"2025-10-10T10:44:23.849Z","unpublished":{"time":"2025-10-10T10:45:23.849Z","versions":["1.18.3"]}},"_rev":"2-b9dd1da47486cec5bb948497a8f1ba6d"}"#,
+            br#"{"_id":"ab-test-wordpress","name":"ab-test-wordpress","time":{"modified":"2025-10-10T10:44:23.849Z","unpublished":{"time":"2025-10-10T10:44:23.849Z","versions":[]}},"_rev":"2-b9dd1da47486cec5bb948497a8f1ba6d"}"#,
             br#"{"name":"ab-test-wordpress","versions":{}}"#,
             br#"{"versions":[]}"#,
             br#"[]"#,
@@ -7000,12 +7089,18 @@ mod tests {
             RegistryVersionSet::PackageNotFound
         ));
 
-        document["packages"][0]["http_status"] = serde_json::json!(200);
-        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
-        let binding = fixture_snapshot_binding(&snapshot_path);
-        assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
-            .unwrap_err()
-            .contains("inconsistent not-found metadata"));
+        for (field, value) in [
+            ("http_status", serde_json::json!(200)),
+            ("response_bytes", serde_json::json!(0)),
+        ] {
+            let mut altered = document.clone();
+            altered["packages"][0][field] = value;
+            std::fs::write(&snapshot_path, serde_json::to_vec(&altered).unwrap()).unwrap();
+            let binding = fixture_snapshot_binding(&snapshot_path);
+            assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
+                .unwrap_err()
+                .contains("inconsistent not-found metadata"));
+        }
     }
 
     #[test]
