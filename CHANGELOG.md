@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Migrated the mutable ThreatDB publication channel to `threatdb-current` after
+  GitHub sealed the former `threatdb-latest` rolling release. The signed legacy
+  channel remains intact as a last-known-good fallback, while new manifests,
+  assets, pruning, and v2 rollback operations use the replacement channel.
+
 ## [0.4.0] - 2026-08-25
 
 ### Added

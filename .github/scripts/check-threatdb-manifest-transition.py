@@ -16,7 +16,8 @@ from typing import Any
 EXPECTED_KEYS = {"version", "sha256", "size", "url", "signature"}
 ASSET_URL = re.compile(
     r"https://github\.com/sheeki03/tirith/releases/download/"
-    r"threatdb-latest/tirith-threatdb-[1-9][0-9]*-[1-9][0-9]*\.dat\Z"
+    r"(?:threatdb-latest|threatdb-current)/"
+    r"tirith-threatdb-[1-9][0-9]*-[1-9][0-9]*\.dat\Z"
 )
 LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 MAX_SAFE_SEQUENCE = 9_007_199_254_740_990
