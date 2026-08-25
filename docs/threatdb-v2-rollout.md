@@ -7,6 +7,10 @@ DB-backed detection silently stops). So the v2 migration is staged so that no
 client is ever served data it cannot read, and the v1 path is never removed until
 adoption is high enough.
 
+The mutable rolling channel is `threatdb-current`. The former
+`threatdb-latest` release is sealed and retained as a last-known-good fallback;
+it must not be deleted or reused.
+
 This runbook covers the rollout sequence, the safety properties that make it
 safe, and how the cutover is gated without any client telemetry.
 
@@ -91,7 +95,7 @@ then remove unreferenced data:
 3. Dispatch `threatdb.yml` after the variable change and wait for it to complete.
    A disabled run publishes the next signed v1 generation, preserves the newest
    authenticated generation as the non-discovery `threatdb-baseline-v2.json`,
-   deletes the fallback `threatdb-index-v2.json` asset from `threatdb-latest`, and
+   deletes the fallback `threatdb-index-v2.json` asset from `threatdb-current`, and
    commits deletion of the primary `threatdb-index-v2.json` on main, in that order.
    Confirm the release index is absent and the raw-main URL returns 404 before
    proceeding. If an emergency manual retirement is necessary, preserve the
@@ -108,7 +112,7 @@ then remove unreferenced data:
    set -euo pipefail
    state=$(mktemp -d)
    trap 'rm -rf -- "$state"' EXIT
-   gh release download threatdb-latest --repo <owner>/<repo> \
+   gh release download threatdb-current --repo <owner>/<repo> \
      --pattern threatdb-baseline-v2.json --dir "$state"
    protected=$(jq -er '.assets[] | select(.format == 2) | .filename' \
      "$state/threatdb-baseline-v2.json")
@@ -116,7 +120,7 @@ then remove unreferenced data:
      echo "invalid protected v2 baseline asset: $protected" >&2
      exit 1
    fi
-   gh release view threatdb-latest --repo <owner>/<repo> --json assets \
+   gh release view threatdb-current --repo <owner>/<repo> --json assets \
      > "$state/assets.json"
    jq -e --arg protected "$protected" \
      '.assets | any(.name == $protected)' "$state/assets.json" >/dev/null
@@ -125,7 +129,7 @@ then remove unreferenced data:
      "$state/assets.json" > "$state/candidates.txt"
    while IFS= read -r asset; do
      if [ "$asset" != "$protected" ]; then
-       gh release delete-asset threatdb-latest "$asset" --repo <owner>/<repo> --yes
+       gh release delete-asset threatdb-current "$asset" --repo <owner>/<repo> --yes
      fi
    done < "$state/candidates.txt"
    ```

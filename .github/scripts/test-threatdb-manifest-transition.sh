@@ -13,7 +13,7 @@ cat > "$TEST_ROOT/base.json" <<EOF
 {"version":100,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":1000,"url":"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-100-1.dat","signature":"$SIGNATURE"}
 EOF
 cat > "$TEST_ROOT/forward.json" <<EOF
-{"version":101,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":1001,"url":"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-101-1.dat","signature":"$SIGNATURE"}
+{"version":101,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":1001,"url":"https://github.com/sheeki03/tirith/releases/download/threatdb-current/tirith-threatdb-101-1.dat","signature":"$SIGNATURE"}
 EOF
 cat > "$TEST_ROOT/regression.json" <<EOF
 {"version":99,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","size":999,"url":"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-99-1.dat","signature":"$SIGNATURE"}
@@ -23,6 +23,9 @@ cat > "$TEST_ROOT/equivocation.json" <<EOF
 EOF
 cat > "$TEST_ROOT/duplicate.json" <<EOF
 {"version":101,"version":102,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":1001,"url":"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-101-1.dat","signature":"$SIGNATURE"}
+EOF
+cat > "$TEST_ROOT/foreign-release.json" <<EOF
+{"version":101,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":1001,"url":"https://github.com/sheeki03/tirith/releases/download/untrusted/tirith-threatdb-101-1.dat","signature":"$SIGNATURE"}
 EOF
 
 python3 "$CHECK_SCRIPT" "$TEST_ROOT/base.json"
@@ -48,5 +51,13 @@ if python3 "$CHECK_SCRIPT" "$TEST_ROOT/duplicate.json" \
   exit 1
 fi
 grep -Fq 'duplicate JSON key: version' "$TEST_ROOT/duplicate.log"
+
+if python3 "$CHECK_SCRIPT" "$TEST_ROOT/foreign-release.json" \
+    > "$TEST_ROOT/foreign-release.log" 2>&1; then
+  echo "expected an untrusted release URL to fail" >&2
+  exit 1
+fi
+grep -Fq 'URL is outside the rolling ThreatDB release' \
+  "$TEST_ROOT/foreign-release.log"
 
 echo "threatdb manifest transition regression passed"

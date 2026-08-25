@@ -24,7 +24,7 @@ static VERIFY_KEY_BYTES: &[u8; PUBLIC_KEY_LENGTH] =
 const MANIFEST_URL_PRIMARY: &str =
     "https://raw.githubusercontent.com/sheeki03/tirith/main/threatdb-manifest.json";
 const MANIFEST_URL_FALLBACK: &str =
-    "https://github.com/sheeki03/tirith/releases/download/threatdb-latest/threatdb-manifest.json";
+    "https://github.com/sheeki03/tirith/releases/download/threatdb-current/threatdb-manifest.json";
 
 /// Signed multi-asset v2 index. A new (v2-capable) client fetches this first,
 /// verifies its signature, and selects the highest compatible asset; on any
@@ -33,7 +33,7 @@ const MANIFEST_URL_FALLBACK: &str =
 const INDEX_V2_URL_PRIMARY: &str =
     "https://raw.githubusercontent.com/sheeki03/tirith/main/threatdb-index-v2.json";
 const INDEX_V2_URL_FALLBACK: &str =
-    "https://github.com/sheeki03/tirith/releases/download/threatdb-latest/threatdb-index-v2.json";
+    "https://github.com/sheeki03/tirith/releases/download/threatdb-current/threatdb-index-v2.json";
 
 const MAX_MANIFEST_SIZE: u64 = 64 * 1024;
 const MAX_DB_SIZE: u64 = 256 * 1024 * 1024;
