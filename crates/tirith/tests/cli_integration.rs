@@ -2249,9 +2249,8 @@ fn capsule_guard_reaps_clone_parent_children_with_untrusted_exit_signals() {
         let guard_state = receipt.unwrap_or_else(|error| {
             panic!("verify untrusted clone exit signal containment: {error}")
         });
-        assert_eq!(
-            direct_exit.unwrap_or_else(|error| panic!("observe guarded capsule leader: {error}")),
-            false,
+        assert!(
+            !direct_exit.unwrap_or_else(|error| panic!("observe guarded capsule leader: {error}")),
             "untrusted clone exit signal terminated the guard before anchored cleanup"
         );
         assert!(
