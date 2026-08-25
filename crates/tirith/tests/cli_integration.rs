@@ -1934,64 +1934,6 @@ fn hidden_capsule_invalid_ack_never_runs_target_and_reaps_group() {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GuardEvent {
-    code: libc::c_int,
-    status: libc::c_int,
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn wait_for_guard_event(
-    guard_pid: u32,
-    event: libc::c_int,
-    timeout: std::time::Duration,
-) -> Result<Option<GuardEvent>, String> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                guard_pid as libc::id_t,
-                &mut info,
-                event | libc::WNOWAIT | libc::WNOHANG,
-            )
-        };
-        if result != 0 {
-            // `waitid` failing here says something specific about the guard, and
-            // the bare errno does not distinguish "already reaped" from "never
-            // our child" — both are ECHILD. Report what the process table says
-            // so the failure names which one it is.
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            let reachable = unsafe { libc::kill(guard_pid as libc::pid_t, 0) } == 0;
-            let stat = std::fs::read_to_string(format!("/proc/{guard_pid}/stat"))
-                .ok()
-                .and_then(|line| {
-                    line.rsplit_once(')')
-                        .map(|(_, rest)| rest.split_whitespace().next().unwrap_or("?").to_string())
-                });
-            return Err(format!(
-                "observe capsule guard without reaping: {error}; guard_pid={guard_pid} \
-                 event={event:#x} signal-0-reachable={reachable} proc-state={stat:?}"
-            ));
-        }
-        if unsafe { info.si_pid() } != 0 {
-            return Ok(Some(GuardEvent {
-                code: info.si_code,
-                status: unsafe { info.si_status() },
-            }));
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn process_group_disappears(group: u32, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -2013,7 +1955,7 @@ fn process_group_disappears(group: u32, timeout: std::time::Duration) -> bool {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn capsule_guard_reaps_clone_parent_children_and_contains_fatal_and_stop_signals() {
+fn capsule_guard_reaps_clone_parent_children_with_untrusted_exit_signals() {
     use std::io::{BufRead as _, BufReader};
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -2226,43 +2168,46 @@ fn capsule_guard_reaps_clone_parent_children_and_contains_fatal_and_stop_signals
             .parse()
             .expect("numeric hostile clone child pid");
 
-        // The signal is already sent when this runs; what remains is the
-        // kernel delivering it and `waitid` reporting it. On a host running the
-        // whole suite in parallel that round trip can exceed a few seconds, and
-        // a timeout is indistinguishable from non-delivery — both return `None`
-        // — so a tight ceiling reports "did not deliver" for a signal that was
-        // delivered. The assertion still fails if the event never arrives.
-        const GUARD_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-        // CLONE_PARENT makes the clone a direct child of the guard. Linux sends
-        // the clone's low-byte termination signal to that parent, so SIGKILL
-        // must kill the guard and SIGSTOP must stop it. Neither signal can be
-        // caught or translated into an exit code. In particular, accepting 137
-        // here would let the target's unrelated CPU rlimit mask non-delivery.
-        let expected = if attack_signal == libc::SIGKILL {
-            GuardEvent {
-                code: libc::CLD_KILLED,
-                status: libc::SIGKILL,
+        // CLONE_PARENT makes the clone a direct child of the guard, but Linux
+        // deliberately does not let the cloner choose that sibling's
+        // termination signal. For legacy clone(2), the kernel replaces the low
+        // byte with the cloner's inherited exit signal; clone3(2) rejects
+        // CLONE_PARENT plus a nonzero exit signal outright. The security
+        // receipt is therefore that even a requested SIGKILL or SIGSTOP is
+        // reaped as an ordinary guard child without killing or stopping the
+        // guard.
+        let receipt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let receipt = loop {
+            let children = fs::read_to_string(&guard_children)
+                .map_err(|error| format!("inspect guard after hostile clone: {error}"))
+                .and_then(|children| {
+                    children
+                        .split_whitespace()
+                        .map(str::parse::<libc::pid_t>)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| format!("parse guard child list: {error}"))
+                });
+            let clone_present = PathBuf::from(format!("/proc/{clone_pid}")).exists();
+            if matches!(&children, Ok(children) if children == &[target_pid]) && !clone_present {
+                let guard_state = fs::read_to_string(format!("/proc/{group}/stat"))
+                    .ok()
+                    .and_then(|line| {
+                        line.rsplit_once(')').and_then(|(_, rest)| {
+                            rest.split_whitespace().next().map(str::to_string)
+                        })
+                    });
+                break Ok(guard_state);
             }
-        } else {
-            GuardEvent {
-                code: libc::CLD_STOPPED,
-                status: libc::SIGSTOP,
+            if std::time::Instant::now() >= receipt_deadline {
+                break Err(format!(
+                    "guard did not reap CLONE_PARENT child {clone_pid} requested with signal \
+                     {attack_signal}: children={children:?} clone-present={clone_present}"
+                ));
             }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        let event = if attack_signal == libc::SIGKILL {
-            libc::WEXITED
-        } else {
-            libc::WSTOPPED
-        };
-        let observed = wait_for_guard_event(group, event, GUARD_EVENT_TIMEOUT);
-        let direct_exit_observed = matches!(
-            &observed,
-            Ok(Some(GuardEvent {
-                code: libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED,
-                ..
-            }))
-        );
+        let direct_exit = observe_test_child_without_reaping(group as libc::pid_t);
+        let direct_exit_observed = matches!(&direct_exit, Ok(true));
 
         // This is the same safety ordering as the production supervisor: signal
         // the complete group while its direct guard is still unreaped, then reap
@@ -2301,22 +2246,25 @@ fn capsule_guard_reaps_clone_parent_children_and_contains_fatal_and_stop_signals
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
-        let observed = observed
-            .unwrap_or_else(|error| panic!("observe selected clone-parent signal: {error}"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "clone child did not deliver signal {attack_signal} to the contained guard \
-                     within {GUARD_EVENT_TIMEOUT:?}"
-                )
-            });
+        let guard_state = receipt.unwrap_or_else(|error| {
+            panic!("verify untrusted clone exit signal containment: {error}")
+        });
         assert_eq!(
-            observed, expected,
-            "clone child must deliver its selected signal directly to the contained guard"
+            direct_exit.unwrap_or_else(|error| panic!("observe guarded capsule leader: {error}")),
+            false,
+            "untrusted clone exit signal terminated the guard before anchored cleanup"
+        );
+        assert!(
+            !matches!(
+                guard_state.as_deref(),
+                Some("T" | "t" | "Z" | "X" | "x") | None
+            ),
+            "untrusted clone exit signal stopped or terminated the guard: state={guard_state:?}"
         );
         assert_eq!(
             status.signal(),
             Some(libc::SIGKILL),
-            "guard must die by the hostile SIGKILL or the anchored group cleanup; \
+            "guard must die only by the anchored group cleanup; \
              observed signal={:?} code={:?}",
             status.signal(),
             status.code()
