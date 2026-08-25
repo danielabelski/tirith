@@ -199,10 +199,28 @@ const MIN_CISA_KEV_RECORDS: usize = 100;
 const MIN_TYPOSQUAT_RECORDS: usize = 100;
 const MAX_BASELINE_DROP_PERCENT: u64 = 50;
 const MAX_OSV_VALUE_BYTES: usize = 256;
-const MAX_BOUNDED_PACKAGE_REQUESTS: usize = 1_000;
-// The pinned bounded set includes @solana/web3.js metadata at 11,975,695
-// uncompressed bytes. Keep a finite per-package ceiling above that reviewed
-// response while the aggregate cap still bounds the complete transaction.
+// Pinned corpus 1ea2762d needs 156 closed-range keys plus 854 non-zero open
+// tails (`introduced: X`, no close) that are materialized from the registry as
+// well: 1,010 unique packages. Keep a finite ceiling with growth headroom.
+const MAX_BOUNDED_PACKAGE_REQUESTS: usize = 2_000;
+// Bounded registry fetches run on this many worker threads. The 854 open-tail
+// npm documents measured 53.8 s wall at 8 workers and about 7 minutes
+// sequentially, against the 420 s registry ceiling in
+// fetch-threatdb-sources.sh.
+const REGISTRY_FETCH_CONCURRENCY: usize = 8;
+// npm's abbreviated metadata keeps every `versions` key while dropping READMEs
+// and per-version manifests (@solana/web3.js: 11,975,695 -> 4,688,592 bytes).
+// PyPI has no abbreviated representation. The requested media type is recorded
+// per package in the snapshot and verified on load, so the reviewed response
+// shape is part of the provenance rather than an ambient client default.
+const NPM_REGISTRY_MEDIA_TYPE: &str = "application/vnd.npm.install-v1+json";
+const JSON_MEDIA_TYPE: &str = "application/json";
+const PYPI_REGISTRY_MEDIA_TYPE: &str = JSON_MEDIA_TYPE;
+const REGISTRY_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+// The largest reviewed response was @solana/web3.js at 11,975,695 bytes as a
+// full document (4,688,592 abbreviated). Keep a finite per-package ceiling
+// above the full-document size while the aggregate cap still bounds the
+// complete transaction.
 const MAX_REGISTRY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 // The reviewed 142-package snapshot totals 92,111,058 response bytes. Keep a
 // bounded 128 MiB transaction ceiling rather than the obsolete 64 MiB limit.
@@ -596,8 +614,10 @@ struct OssfStats {
     direct_whole_package_claims: usize,
     bounded_intervals_materialized: usize,
     empty_registry_intervals_projected: usize,
-    open_ended_boundaries_emitted: usize,
-    registry_not_found_whole_claims: usize,
+    open_ended_intervals: usize,
+    registry_not_found_exact_claims: usize,
+    registry_unpublished_exact_claims: usize,
+    registry_absent_whole_claims: usize,
     exact_versions_emitted: usize,
     unsupported_confirmed_shapes: usize,
     snapshot_failures: usize,
@@ -633,10 +653,9 @@ struct OsvInterval {
 enum RangeProjection {
     None,
     WholePackage,
-    Bounded {
-        intervals: Vec<OsvInterval>,
-        open_boundaries: Vec<String>,
-    },
+    /// Closed intervals and non-zero open tails (`introduced: X`, no close),
+    /// every one of which is materialized against the registry snapshot.
+    Bounded(Vec<OsvInterval>),
 }
 
 #[derive(Debug, Clone)]
@@ -652,6 +671,7 @@ struct PendingOssfClaim {
 enum RegistryVersionSet {
     Versions(Vec<String>),
     PackageNotFound,
+    PackageUnpublished,
 }
 
 trait RegistryVersionProvider {
@@ -673,6 +693,7 @@ struct RegistrySnapshotPackage {
     ecosystem: String,
     name: String,
     source_url: String,
+    media_type: String,
     #[serde(default = "registry_http_ok")]
     http_status: u16,
     #[serde(default)]
@@ -691,7 +712,13 @@ fn registry_http_ok() -> u16 {
 enum RegistrySnapshotResolution {
     #[default]
     RegistryVersions,
+    /// The exact metadata endpoint returned an authenticated HTTP 404.
     PackageNotFound,
+    /// HTTP 200 with no installable version: npm serves a stub document
+    /// (`{"name":…,"modified":…}`, `time.unpublished` in the full form) for a
+    /// fully unpublished package. 374 of the 854 open-tail packages in the
+    /// pinned corpus look like this.
+    PackageUnpublished,
 }
 
 #[derive(Debug)]
@@ -1292,7 +1319,7 @@ impl RegistrySnapshotStore {
         }
         let document: RegistrySnapshotDocument = serde_json::from_slice(&bytes)
             .map_err(|error| format!("invalid registry snapshot JSON: {error}"))?;
-        if document.schema_version != 1 {
+        if document.schema_version != REGISTRY_SNAPSHOT_SCHEMA_VERSION {
             return Err(format!(
                 "unsupported registry snapshot schema {}",
                 document.schema_version
@@ -1339,6 +1366,16 @@ impl RegistrySnapshotStore {
                     key.name
                 ));
             }
+            if !registry_media_type_is_allowed(
+                key.ecosystem,
+                package.http_status,
+                &package.media_type,
+            ) {
+                return Err(format!(
+                    "registry snapshot entry for {} has unexpected media type {:?} for HTTP {}",
+                    key.name, package.media_type, package.http_status
+                ));
+            }
             validate_lower_hex(
                 &package.response_sha256,
                 32,
@@ -1367,13 +1404,29 @@ impl RegistrySnapshotStore {
                     RegistryVersionSet::Versions(versions.clone())
                 }
                 RegistrySnapshotResolution::PackageNotFound => {
-                    if package.http_status != 404 || !versions.is_empty() {
+                    if package.http_status != 404
+                        || package.response_bytes == 0
+                        || !versions.is_empty()
+                    {
                         return Err(format!(
                             "registry snapshot entry for {} has inconsistent not-found metadata",
                             key.name
                         ));
                     }
                     RegistryVersionSet::PackageNotFound
+                }
+                RegistrySnapshotResolution::PackageUnpublished => {
+                    if key.ecosystem != Ecosystem::Npm
+                        || package.http_status != 200
+                        || package.response_bytes == 0
+                        || !versions.is_empty()
+                    {
+                        return Err(format!(
+                            "registry snapshot entry for {} has inconsistent unpublished-package metadata",
+                            key.name
+                        ));
+                    }
+                    RegistryVersionSet::PackageUnpublished
                 }
             };
             for version in &versions {
@@ -1437,7 +1490,6 @@ fn parse_range_projection(
         return Ok(RangeProjection::None);
     }
     let mut intervals = Vec::new();
-    let mut open_boundaries = Vec::new();
     let mut whole_package = false;
     for range in ranges {
         if !range.extra.is_empty() {
@@ -1526,13 +1578,17 @@ fn parse_range_projection(
             if introduced == "0" {
                 whole_package = true;
             } else {
-                // The signed database has no open-ended range encoding. Emit the
-                // validated introduced boundary as an exact known-bad version;
-                // do not silently broaden it into a whole-package claim. Closed
-                // siblings are still materialized from the audited registry
-                // snapshot below.
-                compare_versions(ecosystem, &introduced, &introduced)?;
-                open_boundaries.push(introduced);
+                // The signed database has no open-ended range encoding, so
+                // `>= introduced` is materialized against the audited registry
+                // snapshot like a closed interval: every currently published
+                // version at or above the boundary becomes an exact claim, a
+                // registry 404 becomes a whole-package claim, and a boundary
+                // the registry no longer lists is still emitted exactly. It is
+                // never silently broadened to all versions.
+                intervals.push(OsvInterval {
+                    introduced,
+                    end: None,
+                });
             }
         }
     }
@@ -1545,13 +1601,10 @@ fn parse_range_projection(
     if whole_package {
         return Ok(RangeProjection::WholePackage);
     }
-    if intervals.is_empty() && open_boundaries.is_empty() {
+    if intervals.is_empty() {
         return Err(format!("{} produced no OSV intervals", path.display()));
     }
-    Ok(RangeProjection::Bounded {
-        intervals,
-        open_boundaries,
-    })
+    Ok(RangeProjection::Bounded(intervals))
 }
 
 fn collect_ossf(
@@ -1728,35 +1781,16 @@ fn collect_ossf(
                         reference: reference.clone(),
                     });
                 }
-                RangeProjection::Bounded {
+                // Only ecosystems with a pinned comparator reach here
+                // (parse_range_projection fails closed for the others), and
+                // those are exactly the ecosystems with a registry fetcher.
+                RangeProjection::Bounded(intervals) => pending.push(PendingOssfClaim {
+                    key,
+                    explicit_versions,
                     intervals,
-                    open_boundaries,
-                } => {
-                    stats.open_ended_boundaries_emitted += open_boundaries.len();
-                    explicit_versions.extend(open_boundaries);
-                    explicit_versions.sort();
-                    explicit_versions.dedup();
-                    if intervals.is_empty() {
-                        stats.exact_versions_emitted += explicit_versions.len();
-                        entries.push(PackageEntry {
-                            ecosystem,
-                            name: key.name,
-                            affected_versions: explicit_versions,
-                            all_versions_malicious: false,
-                            source: ThreatSource::OssfMalicious,
-                            confidence,
-                            reference: reference.clone(),
-                        });
-                    } else {
-                        pending.push(PendingOssfClaim {
-                            key,
-                            explicit_versions,
-                            intervals,
-                            confidence,
-                            reference: reference.clone(),
-                        });
-                    }
-                }
+                    confidence,
+                    reference: reference.clone(),
+                }),
                 RangeProjection::None if !explicit_versions.is_empty() => {
                     stats.exact_versions_emitted += explicit_versions.len();
                     entries.push(PackageEntry {
@@ -1819,7 +1853,8 @@ fn interval_contains(
         return Ok(false);
     }
     let Some((kind, end)) = &interval.end else {
-        return Err("non-zero open interval reached materialization".to_string());
+        // An open tail is affected from `introduced` onward (OSV semantics).
+        return Ok(true);
     };
     let ordering = compare_versions(ecosystem, version, end)?;
     Ok(match kind {
@@ -1840,7 +1875,10 @@ fn validate_interval_order(ecosystem: Ecosystem, interval: &OsvInterval) -> Feed
         return Ok(());
     }
     let Some((kind, end)) = &interval.end else {
-        return Err("non-zero open interval is unrepresentable".to_string());
+        // A non-zero open tail has no close to order against; its boundary
+        // must still be a parseable ecosystem version.
+        compare_versions(ecosystem, &interval.introduced, &interval.introduced)?;
+        return Ok(());
     };
     let ordering = compare_versions(ecosystem, &interval.introduced, end)?;
     let valid = match kind {
@@ -1898,32 +1936,63 @@ fn parse_ossf_with_provider(
                 claim.key.name
             )
         })?;
-        if matches!(version_set, RegistryVersionSet::PackageNotFound) {
-            // The exact registry endpoint returned a provenance-bound 404.
-            // With no available universe from which to enumerate a bounded
-            // interval, preserve protection by blocking this confirmed
-            // malicious package identity as a whole. This can only broaden a
-            // package that is absent at snapshot time; a future publication
-            // will reevaluate it if the name reappears.
-            stats.registry_not_found_whole_claims += 1;
-            stats.exact_versions_emitted += claim.explicit_versions.len();
-            entries.push(PackageEntry {
-                ecosystem: claim.key.ecosystem,
-                name: claim.key.name,
-                affected_versions: claim.explicit_versions,
-                all_versions_malicious: true,
-                source: ThreatSource::OssfMalicious,
-                confidence: claim.confidence,
-                reference: claim.reference,
-            });
-            continue;
-        }
-        let RegistryVersionSet::Versions(versions) = version_set else {
-            unreachable!("package-not-found registry snapshots return above")
-        };
+        stats.open_ended_intervals += claim
+            .intervals
+            .iter()
+            .filter(|interval| interval.end.is_none())
+            .count();
+        // The source names these versions as affected regardless of what the
+        // registry currently lists: an `introduced` boundary and a
+        // `last_affected` close are affected by OSV semantics, and a registry
+        // that unpublished them (npm does after an incident) must not make the
+        // claim forget them. `fixed`/`limit` closes are never affected.
         let mut affected = claim.explicit_versions;
         for interval in &claim.intervals {
             validate_interval_order(claim.key.ecosystem, interval)?;
+            if interval.introduced != "0" {
+                affected.push(interval.introduced.clone());
+            }
+            if let Some((RangeEndKind::LastAffected, end)) = &interval.end {
+                affected.push(end.clone());
+            }
+        }
+        let versions = match version_set {
+            RegistryVersionSet::Versions(versions) => versions,
+            RegistryVersionSet::PackageNotFound | RegistryVersionSet::PackageUnpublished => {
+                // The exact registry endpoint returned an authenticated 404, or
+                // npm's stub for a fully unpublished package. There is no
+                // universe to enumerate, so the claim stays exactly what the
+                // source names. It is deliberately NOT broadened to the whole
+                // name: dependency-confusion targets are names that legitimately
+                // exist in private registries, and a version-bounded record
+                // says nothing about those versions. Only when the record names
+                // no exact version at all (for example `[0, fixed X)`) is the
+                // absent public package claimed as a whole, since every version
+                // the source can mean is below X and nothing is installable.
+                affected.sort();
+                affected.dedup();
+                let whole_package = affected.is_empty();
+                if whole_package {
+                    stats.registry_absent_whole_claims += 1;
+                } else if matches!(version_set, RegistryVersionSet::PackageNotFound) {
+                    stats.registry_not_found_exact_claims += 1;
+                } else {
+                    stats.registry_unpublished_exact_claims += 1;
+                }
+                stats.exact_versions_emitted += affected.len();
+                entries.push(PackageEntry {
+                    ecosystem: claim.key.ecosystem,
+                    name: claim.key.name,
+                    affected_versions: affected,
+                    all_versions_malicious: whole_package,
+                    source: ThreatSource::OssfMalicious,
+                    confidence: claim.confidence,
+                    reference: claim.reference,
+                });
+                continue;
+            }
+        };
+        for interval in &claim.intervals {
             let mut interval_matches = 0usize;
             for version in versions {
                 if interval_contains(claim.key.ecosystem, interval, version)? {
@@ -1932,28 +2001,9 @@ fn parse_ossf_with_provider(
                 }
             }
             if interval_matches == 0 {
-                // Registries can omit versions after an incident (for example,
-                // npm unpublishes). Preserve the exact source claim without
-                // turning the package into a false whole-package block: an
-                // introduced boundary is affected, and a `last_affected` close
-                // is affected as well. `fixed`/`limit` closes are excluded by
-                // OSV semantics and must never be emitted as malicious.
-                let mut projected_boundary = false;
-                if interval.introduced != "0" {
-                    affected.push(interval.introduced.clone());
-                    projected_boundary = true;
-                }
-                if let Some((RangeEndKind::LastAffected, end)) = &interval.end {
-                    affected.push(end.clone());
-                    projected_boundary = true;
-                }
-                if !projected_boundary {
-                    return Err(format!(
-                        "bounded interval for {}:{} has no registry versions or exact affected boundary",
-                        claim.key.ecosystem, claim.key.name
-                    ));
-                }
                 stats.empty_registry_intervals_projected += 1;
+            } else {
+                stats.bounded_intervals_materialized += 1;
             }
         }
         affected.sort();
@@ -1964,7 +2014,6 @@ fn parse_ossf_with_provider(
                 claim.key.ecosystem, claim.key.name
             ));
         }
-        stats.bounded_intervals_materialized += claim.intervals.len();
         stats.exact_versions_emitted += affected.len();
         entries.push(PackageEntry {
             ecosystem: claim.key.ecosystem,
@@ -3807,7 +3856,109 @@ fn registry_metadata_url(key: &RegistryPackageKey) -> FeedResult<url::Url> {
     Ok(url)
 }
 
-fn extract_registry_versions(key: &RegistryPackageKey, bytes: &[u8]) -> FeedResult<Vec<String>> {
+/// The exact `Accept` value sent for one ecosystem's metadata request. It is
+/// recorded in the snapshot and verified on load so the reviewed response
+/// shape is bound into provenance.
+fn registry_media_type(ecosystem: Ecosystem) -> FeedResult<&'static str> {
+    match ecosystem {
+        Ecosystem::Npm => Ok(NPM_REGISTRY_MEDIA_TYPE),
+        Ecosystem::PyPI => Ok(PYPI_REGISTRY_MEDIA_TYPE),
+        ecosystem => Err(format!(
+            "bounded registry snapshots are unsupported for {ecosystem}"
+        )),
+    }
+}
+
+/// What one HTTP 200 metadata document positively is. Anything that is
+/// neither shape fails closed: a 200 with an unexpected body must never be
+/// inferred to mean "no versions", because that inference would let a
+/// transient error body change what the database claims.
+#[derive(Debug, PartialEq, Eq)]
+enum RegistryDocument {
+    /// The installable version keys, sorted and unique.
+    Versions(Vec<String>),
+    /// npm's stub for a fully unpublished package: a JSON object whose `name`
+    /// is the requested package and which has no `versions` key at all
+    /// (`{"name":…,"modified":…}` in the abbreviated form; the full form adds
+    /// `time.unpublished`). 374 of the 854 open tails in the pinned corpus.
+    NpmUnpublishedStub,
+}
+
+fn npm_unpublished_stub_is_authentic(
+    key: &RegistryPackageKey,
+    document: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let named_self = document
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| name == key.name);
+    if !named_self {
+        return false;
+    }
+    let registry_timestamp = |value: &serde_json::Value| {
+        value.as_str().is_some_and(|timestamp| {
+            timestamp.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(timestamp).is_ok()
+        })
+    };
+
+    // The abbreviated install-v1 response is exactly
+    // {"name": <requested>, "modified": <RFC3339>}. Requiring the exact key
+    // set prevents a name-bearing error document from becoming an unpublished
+    // classification.
+    let abbreviated = document.len() == 2
+        && document.contains_key("name")
+        && document.get("modified").is_some_and(registry_timestamp);
+    if abbreviated {
+        return true;
+    }
+
+    // npm can ignore the abbreviated Accept value and return the full CouchDB
+    // document. Positively identify that form through its matching identity,
+    // revision, and time.unpublished receipt. A generic object that merely
+    // echoes the requested name is not sufficient.
+    let matching_id = document
+        .get("_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| id == key.name);
+    let has_revision = document
+        .get("_rev")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|revision| validate_osv_value(revision, "npm registry revision").is_ok());
+    let Some(time) = document.get("time").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let Some(unpublished) = time
+        .get("unpublished")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    let modified = time.get("modified");
+    let unpublished_at = unpublished.get("time");
+    let timestamps_match =
+        modified
+            .zip(unpublished_at)
+            .is_some_and(|(modified, unpublished_at)| {
+                modified == unpublished_at
+                    && registry_timestamp(modified)
+                    && registry_timestamp(unpublished_at)
+            });
+    let unpublished_versions = unpublished
+        .get("versions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|versions| {
+            !versions.is_empty()
+                && versions.len() <= MAX_REGISTRY_VERSIONS_PER_PACKAGE
+                && versions.iter().all(|version| {
+                    version.as_str().is_some_and(|version| {
+                        validate_osv_value(version, "unpublished registry version").is_ok()
+                    })
+                })
+        });
+    matching_id && has_revision && timestamps_match && unpublished_versions
+}
+
+fn parse_registry_document(key: &RegistryPackageKey, bytes: &[u8]) -> FeedResult<RegistryDocument> {
     let document: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid registry response for {}: {error}", key.name))?;
     let field = match key.ecosystem {
@@ -3815,10 +3966,24 @@ fn extract_registry_versions(key: &RegistryPackageKey, bytes: &[u8]) -> FeedResu
         Ecosystem::PyPI => "releases",
         _ => return Err(format!("unsupported registry ecosystem {}", key.ecosystem)),
     };
-    let versions = document
-        .get(field)
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| format!("registry response for {} has no {field} object", key.name))?;
+    let document = document
+        .as_object()
+        .ok_or_else(|| format!("registry response for {} is not a JSON object", key.name))?;
+    let Some(value) = document.get(field) else {
+        if key.ecosystem == Ecosystem::Npm && npm_unpublished_stub_is_authentic(key, document) {
+            return Ok(RegistryDocument::NpmUnpublishedStub);
+        }
+        return Err(format!(
+            "registry response for {} has no {field} object and is not a recognized unpublished stub",
+            key.name
+        ));
+    };
+    let versions = value.as_object().ok_or_else(|| {
+        format!(
+            "registry response for {} has a non-object {field} field",
+            key.name
+        )
+    })?;
     if versions.is_empty() || versions.len() > MAX_REGISTRY_VERSIONS_PER_PACKAGE {
         return Err(format!(
             "registry response for {} contains {} versions, outside 1..={} cap",
@@ -3833,7 +3998,219 @@ fn extract_registry_versions(key: &RegistryPackageKey, bytes: &[u8]) -> FeedResu
     }
     output.sort();
     output.dedup();
-    Ok(output)
+    Ok(RegistryDocument::Versions(output))
+}
+
+/// A 404 counts as an authenticated not-found only when the body is the
+/// registry's own not-found document, not an edge/CDN error page.
+fn registry_not_found_body_is_authentic(ecosystem: Ecosystem, bytes: &[u8]) -> bool {
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    let Some(object) = document.as_object() else {
+        return false;
+    };
+    let field = match ecosystem {
+        Ecosystem::Npm => "error",
+        Ecosystem::PyPI => "message",
+        _ => return false,
+    };
+    object.len() == 1
+        && object
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text.eq_ignore_ascii_case("not found"))
+}
+
+/// The response media types accepted for one ecosystem and HTTP status. The
+/// recorded value is what the registry actually served (the Content-Type
+/// essence), which is what the hashed bytes are, not what was requested. npm
+/// may ignore `Accept` and serve the full document; both shapes parse and the
+/// per-response byte cap still bounds them.
+fn registry_media_type_is_allowed(
+    ecosystem: Ecosystem,
+    http_status: u16,
+    media_type: &str,
+) -> bool {
+    match (ecosystem, http_status) {
+        (Ecosystem::Npm, 200) => {
+            media_type == NPM_REGISTRY_MEDIA_TYPE || media_type == JSON_MEDIA_TYPE
+        }
+        (Ecosystem::Npm, 404) | (Ecosystem::PyPI, 200) | (Ecosystem::PyPI, 404) => {
+            media_type == JSON_MEDIA_TYPE
+        }
+        _ => false,
+    }
+}
+
+/// One raw registry request: exact URL, exact `Accept`, no redirects, HTTP 200
+/// or 404 only, per-response byte cap. Returns the status, the Content-Type
+/// essence (lowercased, parameters stripped) and the body bytes.
+fn fetch_registry_document(
+    client: &reqwest::blocking::Client,
+    url: &url::Url,
+    accept: &str,
+    label: &str,
+) -> FeedResult<(u16, String, Vec<u8>)> {
+    let response = client
+        .get(url.clone())
+        .header(reqwest::header::ACCEPT, accept)
+        .send()
+        .map_err(|error| format!("registry snapshot request for {label} failed: {error}"))?;
+    let http_status = response.status().as_u16();
+    if http_status != 200 && http_status != 404 {
+        return Err(format!(
+            "registry snapshot request for {label} returned {}",
+            response.status()
+        ));
+    }
+    if response.url() != url {
+        return Err(format!("registry request for {label} redirected"));
+    }
+    let media_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+    let mut bytes = Vec::new();
+    response
+        .take((MAX_REGISTRY_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read registry response for {label}: {error}"))?;
+    if bytes.len() > MAX_REGISTRY_RESPONSE_BYTES {
+        return Err(format!("registry response for {label} exceeds byte cap"));
+    }
+    Ok((http_status, media_type, bytes))
+}
+
+/// One bounded metadata request classified into a snapshot entry. The
+/// aggregate byte cap is enforced across workers by [`fetch_all_bounded`].
+fn fetch_registry_snapshot_package(
+    client: &reqwest::blocking::Client,
+    key: &RegistryPackageKey,
+) -> FeedResult<RegistrySnapshotPackage> {
+    let url = registry_metadata_url(key)?;
+    let accept = registry_media_type(key.ecosystem)?;
+    let (http_status, media_type, bytes) =
+        fetch_registry_document(client, &url, accept, &key.name)?;
+    if !registry_media_type_is_allowed(key.ecosystem, http_status, &media_type) {
+        return Err(format!(
+            "registry response for {} has unexpected media type {media_type:?} for HTTP {http_status}",
+            key.name
+        ));
+    }
+    let (resolution, versions) = if http_status == 404 {
+        if !registry_not_found_body_is_authentic(key.ecosystem, &bytes) {
+            return Err(format!(
+                "registry 404 for {} does not carry the registry's own not-found document",
+                key.name
+            ));
+        }
+        (RegistrySnapshotResolution::PackageNotFound, Vec::new())
+    } else {
+        match parse_registry_document(key, &bytes)? {
+            RegistryDocument::Versions(versions) => {
+                (RegistrySnapshotResolution::RegistryVersions, versions)
+            }
+            RegistryDocument::NpmUnpublishedStub => {
+                (RegistrySnapshotResolution::PackageUnpublished, Vec::new())
+            }
+        }
+    };
+    Ok(RegistrySnapshotPackage {
+        ecosystem: key.ecosystem.to_string(),
+        name: key.name.clone(),
+        source_url: url.to_string(),
+        media_type,
+        http_status,
+        resolution,
+        response_sha256: format!("{:x}", Sha256::digest(&bytes)),
+        response_bytes: bytes.len(),
+        versions,
+    })
+}
+
+/// Run `fetch_one` over `requests` on up to `concurrency` worker threads.
+/// Results keep the input order, the aggregate response byte cap is enforced
+/// across every worker, and the first failure stops all workers before they
+/// take another request. Errors are reported lowest input index first, so the
+/// outcome for a given request set does not depend on scheduling.
+fn fetch_all_bounded<F>(
+    requests: Vec<RegistryPackageKey>,
+    concurrency: usize,
+    fetch_one: F,
+) -> FeedResult<Vec<RegistrySnapshotPackage>>
+where
+    F: Fn(&RegistryPackageKey) -> FeedResult<RegistrySnapshotPackage> + Sync,
+{
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Mutex;
+
+    let concurrency = concurrency.clamp(1, requests.len().max(1));
+    let next = AtomicUsize::new(0);
+    let aggregate_bytes = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let slots: Mutex<Vec<Option<FeedResult<RegistrySnapshotPackage>>>> =
+        Mutex::new((0..requests.len()).map(|_| None).collect());
+    let requests = &requests;
+    let fetch_one = &fetch_one;
+    let record = |index: usize, result: FeedResult<RegistrySnapshotPackage>| {
+        if result.is_err() {
+            stop.store(true, AtomicOrdering::SeqCst);
+        }
+        slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] = Some(result);
+    };
+    std::thread::scope(|scope| {
+        for _ in 0..concurrency {
+            scope.spawn(|| loop {
+                if stop.load(AtomicOrdering::SeqCst) {
+                    break;
+                }
+                let index = next.fetch_add(1, AtomicOrdering::SeqCst);
+                if index >= requests.len() {
+                    break;
+                }
+                let result = fetch_one(&requests[index]).and_then(|package| {
+                    let total = aggregate_bytes
+                        .fetch_add(package.response_bytes, AtomicOrdering::SeqCst)
+                        .checked_add(package.response_bytes)
+                        .ok_or_else(|| "registry aggregate byte count overflow".to_string())?;
+                    if total > MAX_REGISTRY_AGGREGATE_BYTES {
+                        return Err("registry responses exceed aggregate byte cap".to_string());
+                    }
+                    Ok(package)
+                });
+                record(index, result);
+            });
+        }
+    });
+    let slots = slots
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut packages = Vec::with_capacity(slots.len());
+    for (index, slot) in slots.into_iter().enumerate() {
+        match slot {
+            Some(Ok(package)) => packages.push(package),
+            Some(Err(error)) => return Err(error),
+            None => {
+                return Err(format!(
+                    "registry snapshot request for {} was not completed",
+                    requests[index].name
+                ))
+            }
+        }
+    }
+    Ok(packages)
 }
 
 fn fetch_registry_snapshots(root: &Path, ossf_commit: &str, output: &Path) -> FeedResult<()> {
@@ -3865,62 +4242,13 @@ fn fetch_registry_snapshots(root: &Path, ossf_commit: &str, output: &Path) -> Fe
         ))
         .build()
         .map_err(|error| format!("cannot build bounded registry client: {error}"))?;
-    let mut aggregate_bytes = 0usize;
-    let mut packages = Vec::with_capacity(requests.len());
-    for key in requests {
-        let url = registry_metadata_url(&key)?;
-        let response = client.get(url.clone()).send().map_err(|error| {
-            format!("registry snapshot request for {} failed: {error}", key.name)
-        })?;
-        let http_status = response.status().as_u16();
-        if http_status != 200 && http_status != 404 {
-            return Err(format!(
-                "registry snapshot request for {} returned {}",
-                key.name,
-                response.status()
-            ));
-        }
-        if response.url() != &url {
-            return Err(format!("registry request for {} redirected", key.name));
-        }
-        let mut bytes = Vec::new();
-        response
-            .take((MAX_REGISTRY_RESPONSE_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("cannot read registry response for {}: {error}", key.name))?;
-        if bytes.len() > MAX_REGISTRY_RESPONSE_BYTES {
-            return Err(format!(
-                "registry response for {} exceeds byte cap",
-                key.name
-            ));
-        }
-        aggregate_bytes = aggregate_bytes
-            .checked_add(bytes.len())
-            .ok_or_else(|| "registry aggregate byte count overflow".to_string())?;
-        if aggregate_bytes > MAX_REGISTRY_AGGREGATE_BYTES {
-            return Err("registry responses exceed aggregate byte cap".to_string());
-        }
-        let (resolution, versions) = if http_status == 404 {
-            (RegistrySnapshotResolution::PackageNotFound, Vec::new())
-        } else {
-            (
-                RegistrySnapshotResolution::RegistryVersions,
-                extract_registry_versions(&key, &bytes)?,
-            )
-        };
-        packages.push(RegistrySnapshotPackage {
-            ecosystem: key.ecosystem.to_string(),
-            name: key.name,
-            source_url: url.to_string(),
-            http_status,
-            resolution,
-            response_sha256: format!("{:x}", Sha256::digest(&bytes)),
-            response_bytes: bytes.len(),
-            versions,
-        });
-    }
+    let packages = fetch_all_bounded(
+        requests.into_iter().collect(),
+        REGISTRY_FETCH_CONCURRENCY,
+        |key| fetch_registry_snapshot_package(&client, key),
+    )?;
     let document = RegistrySnapshotDocument {
-        schema_version: 1,
+        schema_version: REGISTRY_SNAPSHOT_SCHEMA_VERSION,
         ossf_commit: ossf_commit.to_string(),
         retrieved_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         packages,
@@ -4071,15 +4399,17 @@ fn main() {
             require_minimum("OSSF", unique_packages, MIN_OSSF_PACKAGES),
         );
         eprintln!(
-            "    {} entries scanned, {} unique packages ({} parsed claims), {} whole-package claims, {} bounded intervals, {} empty-registry intervals projected exactly, {} open boundaries emitted exactly, {} registry-404 whole-package fallbacks, {} exact versions, {} withdrawn, {} non-malicious, {} unknown ecosystem, {} unsupported shapes, {} snapshot failures",
+            "    {} entries scanned, {} unique packages ({} parsed claims), {} whole-package claims, {} bounded intervals, {} empty-registry intervals projected exactly, {} open-ended intervals, {} registry-404 exact claims, {} registry-unpublished exact claims, {} registry-absent whole-package claims, {} exact versions, {} withdrawn, {} non-malicious, {} unknown ecosystem, {} unsupported shapes, {} snapshot failures",
             stats.total_entries,
             unique_packages,
             stats.parsed_packages,
             stats.direct_whole_package_claims,
             stats.bounded_intervals_materialized,
             stats.empty_registry_intervals_projected,
-            stats.open_ended_boundaries_emitted,
-            stats.registry_not_found_whole_claims,
+            stats.open_ended_intervals,
+            stats.registry_not_found_exact_claims,
+            stats.registry_unpublished_exact_claims,
+            stats.registry_absent_whole_claims,
             stats.exact_versions_emitted,
             stats.skipped_withdrawn,
             stats.skipped_non_malicious,
@@ -4516,12 +4846,20 @@ fn main() {
                     ossf_stats.empty_registry_intervals_projected,
                 ),
                 (
-                    "open_ended_boundaries_emitted".to_string(),
-                    ossf_stats.open_ended_boundaries_emitted,
+                    "open_ended_intervals".to_string(),
+                    ossf_stats.open_ended_intervals,
                 ),
                 (
-                    "registry_not_found_whole_claims".to_string(),
-                    ossf_stats.registry_not_found_whole_claims,
+                    "registry_not_found_exact_claims".to_string(),
+                    ossf_stats.registry_not_found_exact_claims,
+                ),
+                (
+                    "registry_unpublished_exact_claims".to_string(),
+                    ossf_stats.registry_unpublished_exact_claims,
+                ),
+                (
+                    "registry_absent_whole_claims".to_string(),
+                    ossf_stats.registry_absent_whole_claims,
                 ),
                 (
                     "exact_versions_emitted".to_string(),
@@ -5002,6 +5340,7 @@ mod tests {
         calls: Vec<RegistryPackageKey>,
         versions: BTreeMap<RegistryPackageKey, Vec<String>>,
         not_found: BTreeSet<RegistryPackageKey>,
+        unpublished: BTreeSet<RegistryPackageKey>,
     }
 
     impl RegistryVersionProvider for SpyRegistryVersions {
@@ -5009,6 +5348,9 @@ mod tests {
             self.calls.push(key.clone());
             if self.not_found.contains(key) {
                 return Ok(RegistryVersionSet::PackageNotFound);
+            }
+            if self.unpublished.contains(key) {
+                return Ok(RegistryVersionSet::PackageUnpublished);
             }
             self.versions
                 .get(key)
@@ -5424,6 +5766,206 @@ mod tests {
         assert_eq!(summary.content_sha256, expected);
     }
 
+    fn synthetic_snapshot_package(
+        key: &RegistryPackageKey,
+        bytes: usize,
+    ) -> RegistrySnapshotPackage {
+        RegistrySnapshotPackage {
+            ecosystem: key.ecosystem.to_string(),
+            name: key.name.clone(),
+            source_url: registry_metadata_url(key).unwrap().to_string(),
+            media_type: registry_media_type(key.ecosystem).unwrap().to_string(),
+            http_status: 200,
+            resolution: RegistrySnapshotResolution::RegistryVersions,
+            response_sha256: "ab".repeat(32),
+            response_bytes: bytes,
+            versions: vec!["1.0.0".to_string()],
+        }
+    }
+
+    fn synthetic_request_keys(count: usize) -> Vec<RegistryPackageKey> {
+        (0..count)
+            .map(|index| RegistryPackageKey {
+                ecosystem: Ecosystem::Npm,
+                name: format!("pkg-{index:03}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parallel_bounded_fetch_preserves_request_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let requests = synthetic_request_keys(23);
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let packages = fetch_all_bounded(requests.clone(), 8, |key| {
+            let now = in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            peak.fetch_max(now, AtomicOrdering::SeqCst);
+            // Later requests finish first so ordering cannot come from timing.
+            let index: u64 = key.name.trim_start_matches("pkg-").parse().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30 - index));
+            in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+            Ok(synthetic_snapshot_package(key, 10))
+        })
+        .unwrap();
+        assert_eq!(
+            packages.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            requests.iter().map(|k| k.name.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            peak.load(AtomicOrdering::SeqCst) > 1,
+            "workers must overlap"
+        );
+        assert!(peak.load(AtomicOrdering::SeqCst) <= 8);
+    }
+
+    #[test]
+    fn parallel_bounded_fetch_reports_the_lowest_failure_and_stops_taking_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let requests = synthetic_request_keys(200);
+        let attempted = AtomicUsize::new(0);
+        let error = fetch_all_bounded(requests, 4, |key| {
+            attempted.fetch_add(1, AtomicOrdering::SeqCst);
+            // Two failures; the earlier index fails LATER in wall time, so the
+            // reported error must come from index order, not completion order.
+            match key.name.as_str() {
+                "pkg-005" => {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    return Err("boom for pkg-005".to_string());
+                }
+                "pkg-006" => return Err("boom for pkg-006".to_string()),
+                _ => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            Ok(synthetic_snapshot_package(key, 1))
+        })
+        .unwrap_err();
+        assert_eq!(error, "boom for pkg-005");
+        assert!(
+            attempted.load(AtomicOrdering::SeqCst) < 200,
+            "a failure must stop workers from taking every remaining request"
+        );
+    }
+
+    #[test]
+    fn registry_snapshot_rejects_more_packages_than_the_bounded_request_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot_path = directory.path().join("registry-versions.json");
+        let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
+        let template = document["packages"][0].clone();
+        let mut packages = Vec::with_capacity(MAX_BOUNDED_PACKAGE_REQUESTS + 1);
+        for index in 0..=MAX_BOUNDED_PACKAGE_REQUESTS {
+            let mut package = template.clone();
+            let name = format!("pkg-{index:04}");
+            package["name"] = serde_json::json!(name);
+            package["source_url"] = serde_json::json!(format!("https://registry.npmjs.org/{name}"));
+            packages.push(package);
+        }
+        document["packages"] = serde_json::Value::Array(packages);
+        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        let error = RegistrySnapshotStore::load(&snapshot_path, &binding).unwrap_err();
+        assert!(error.contains("bounded-package cap"), "{error}");
+    }
+
+    #[test]
+    fn parallel_bounded_fetch_enforces_the_aggregate_byte_cap_across_workers() {
+        let requests = synthetic_request_keys(16);
+        let per_response = MAX_REGISTRY_AGGREGATE_BYTES / 10;
+        let error = fetch_all_bounded(requests.clone(), 8, |key| {
+            Ok(synthetic_snapshot_package(key, per_response))
+        })
+        .unwrap_err();
+        assert!(error.contains("aggregate byte cap"), "{error}");
+        let packages = fetch_all_bounded(requests, 8, |key| {
+            Ok(synthetic_snapshot_package(
+                key,
+                MAX_REGISTRY_AGGREGATE_BYTES / 16,
+            ))
+        })
+        .unwrap();
+        assert_eq!(packages.len(), 16);
+    }
+
+    #[test]
+    fn parallel_bounded_fetch_handles_an_empty_request_set() {
+        let packages =
+            fetch_all_bounded(Vec::new(), 8, |key| Ok(synthetic_snapshot_package(key, 1))).unwrap();
+        assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn registry_snapshot_binds_the_requested_media_type_and_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot_path = directory.path().join("registry-versions.json");
+        let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
+        assert_eq!(
+            document["packages"][0]["media_type"],
+            NPM_REGISTRY_MEDIA_TYPE
+        );
+
+        // npm may ignore Accept and serve the full document: still valid.
+        document["packages"][0]["media_type"] = serde_json::json!(JSON_MEDIA_TYPE);
+        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        RegistrySnapshotStore::load(&snapshot_path, &binding).unwrap();
+
+        document["packages"][0]["media_type"] = serde_json::json!("text/html");
+        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
+            .unwrap_err()
+            .contains("unexpected media type"));
+
+        // A 404 is only ever served as application/json.
+        let mut not_found = document.clone();
+        not_found["packages"][0]["media_type"] = serde_json::json!(NPM_REGISTRY_MEDIA_TYPE);
+        not_found["packages"][0]["resolution"] = serde_json::json!("package_not_found");
+        not_found["packages"][0]["http_status"] = serde_json::json!(404);
+        not_found["packages"][0]["versions"] = serde_json::json!([]);
+        std::fs::write(&snapshot_path, serde_json::to_vec(&not_found).unwrap()).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
+            .unwrap_err()
+            .contains("unexpected media type"));
+
+        document["packages"][0]["media_type"] = serde_json::json!(NPM_REGISTRY_MEDIA_TYPE);
+        document["schema_version"] = serde_json::json!(1);
+        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
+            .unwrap_err()
+            .contains("unsupported registry snapshot schema 1"));
+
+        let mut without_media_type = document.clone();
+        without_media_type["schema_version"] = serde_json::json!(REGISTRY_SNAPSHOT_SCHEMA_VERSION);
+        without_media_type["packages"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("media_type");
+        let bytes = serde_json::to_vec(&without_media_type).unwrap();
+        std::fs::write(&snapshot_path, &bytes).unwrap();
+        // The fixture helper parses the document itself, so bind by hand here.
+        let binding = SourceTransactionBinding {
+            provenance_sha256: "11".repeat(32),
+            registry_snapshot_sha256: sha256_hex(&bytes),
+            ossf_commit: without_media_type["ossf_commit"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            registry_retrieved_at: without_media_type["retrieved_at"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            registry_packages: 1,
+        };
+        let error = RegistrySnapshotStore::load(&snapshot_path, &binding).unwrap_err();
+        assert!(
+            error.contains("invalid registry snapshot JSON") && error.contains("media_type"),
+            "{error}"
+        );
+    }
+
     fn fixture_snapshot_binding(snapshot_path: &Path) -> SourceTransactionBinding {
         let bytes = std::fs::read(snapshot_path).unwrap();
         let document: RegistrySnapshotDocument = serde_json::from_slice(&bytes).unwrap();
@@ -5564,11 +6106,9 @@ mod tests {
         assert_eq!(stats.direct_whole_package_claims, 3);
     }
 
-    #[test]
-    fn nonzero_open_range_emits_known_versions_without_broadening() {
-        let directory = tempfile::tempdir().unwrap();
+    fn write_open_tail_record(directory: &Path) -> RegistryPackageKey {
         write_mal(
-            directory.path(),
+            directory,
             "MAL-2099-0023.json",
             r#"{
                 "id":"MAL-2099-0023",
@@ -5579,18 +6119,388 @@ mod tests {
                 }]
             }"#,
         );
+        RegistryPackageKey {
+            ecosystem: Ecosystem::Npm,
+            name: "open-package".to_string(),
+        }
+    }
+
+    #[test]
+    fn nonzero_open_range_materializes_every_registry_version_at_or_above_introduced() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = write_open_tail_record(directory.path());
         let mut spy = SpyRegistryVersions::default();
+        spy.versions.insert(
+            key.clone(),
+            [
+                "0.9.0",
+                "1.0.0",
+                "1.0.1-rc.1",
+                "1.0.1",
+                "1.0.3",
+                "2.0.0-beta.1",
+                "2.0.0",
+            ]
+            .iter()
+            .map(|v| v.to_string())
+            .collect(),
+        );
         let (entries, stats, _) =
             parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+        assert_eq!(spy.calls, [key]);
+        assert_eq!(entries.len(), 1);
         assert!(
-            spy.calls.is_empty(),
-            "an open tail must not trigger live expansion"
+            !entries[0].all_versions_malicious,
+            "an open tail must not broaden to versions below introduced"
         );
+        // `1.0.1-rc.1` precedes `1.0.1` in semver and must stay excluded.
+        assert_eq!(
+            entries[0].affected_versions,
+            ["1.0.1", "1.0.2", "1.0.3", "2.0.0", "2.0.0-beta.1"]
+        );
+        assert_eq!(stats.open_ended_intervals, 1);
+        assert_eq!(stats.bounded_intervals_materialized, 1);
+        assert_eq!(stats.empty_registry_intervals_projected, 0);
+    }
+
+    #[test]
+    fn nonzero_open_range_keeps_its_boundary_when_only_later_versions_remain() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = write_open_tail_record(directory.path());
+        let mut spy = SpyRegistryVersions::default();
+        spy.versions
+            .insert(key.clone(), vec!["1.0.0".to_string(), "1.0.4".to_string()]);
+        let (entries, stats, _) =
+            parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].all_versions_malicious);
+        assert_eq!(entries[0].affected_versions, ["1.0.1", "1.0.2", "1.0.4"]);
+        assert_eq!(stats.bounded_intervals_materialized, 1);
+    }
+
+    #[test]
+    fn nonzero_open_range_with_no_registry_version_at_or_above_introduced_keeps_exact_boundary() {
+        // The dependency-confusion shape: npm removed the attacker's version and
+        // the legitimate lower releases remain. Only the exact boundary and
+        // explicit versions may be claimed.
+        let directory = tempfile::tempdir().unwrap();
+        let key = write_open_tail_record(directory.path());
+        let mut spy = SpyRegistryVersions::default();
+        spy.versions
+            .insert(key.clone(), vec!["0.9.0".to_string(), "1.0.0".to_string()]);
+        let (entries, stats, _) =
+            parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+        assert_eq!(spy.calls, [key]);
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].all_versions_malicious);
         assert_eq!(entries[0].affected_versions, ["1.0.1", "1.0.2"]);
-        assert_eq!(stats.open_ended_boundaries_emitted, 1);
-        assert_eq!(stats.bounded_intervals_materialized, 0);
+        assert_eq!(stats.open_ended_intervals, 1);
+        assert_eq!(stats.empty_registry_intervals_projected, 1);
+    }
+
+    #[test]
+    fn nonzero_open_range_on_an_absent_package_keeps_exact_claims_only() {
+        // A dependency-confusion target legitimately exists in a private
+        // registry; a version-bounded record on the absent public name must
+        // not be broadened to every version of that name.
+        for (absent, expected_not_found, expected_unpublished) in
+            [(true, 1usize, 0usize), (false, 0, 1)]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let key = write_open_tail_record(directory.path());
+            let mut spy = SpyRegistryVersions::default();
+            if absent {
+                spy.not_found.insert(key.clone());
+            } else {
+                spy.unpublished.insert(key.clone());
+            }
+            let (entries, stats, _) =
+                parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+            assert_eq!(spy.calls, [key]);
+            assert_eq!(entries.len(), 1);
+            assert!(!entries[0].all_versions_malicious);
+            assert_eq!(entries[0].affected_versions, ["1.0.1", "1.0.2"]);
+            assert_eq!(stats.open_ended_intervals, 1);
+            assert_eq!(stats.registry_not_found_exact_claims, expected_not_found);
+            assert_eq!(
+                stats.registry_unpublished_exact_claims,
+                expected_unpublished
+            );
+            assert_eq!(stats.registry_absent_whole_claims, 0);
+        }
+    }
+
+    #[test]
+    fn registry_documents_are_classified_positively_or_fail_closed() {
+        let key = RegistryPackageKey {
+            ecosystem: Ecosystem::Npm,
+            name: "ab-test-wordpress".to_string(),
+        };
+        // npm's abbreviated stub for a fully unpublished package.
+        assert_eq!(
+            parse_registry_document(
+                &key,
+                br#"{"name":"ab-test-wordpress","modified":"2025-10-10T10:44:23.849Z"}"#
+            )
+            .unwrap(),
+            RegistryDocument::NpmUnpublishedStub
+        );
+        // npm's full CouchDB form positively records the unpublished version
+        // and binds the package identity and revision.
+        assert_eq!(
+            parse_registry_document(
+                &key,
+                br#"{"_id":"ab-test-wordpress","name":"ab-test-wordpress","time":{"created":"2025-10-10T10:42:51.227Z","modified":"2025-10-10T10:44:23.849Z","1.18.3":"2025-10-10T10:42:51.509Z","unpublished":{"time":"2025-10-10T10:44:23.849Z","versions":["1.18.3"]}},"_rev":"2-b9dd1da47486cec5bb948497a8f1ba6d"}"#
+            )
+            .unwrap(),
+            RegistryDocument::NpmUnpublishedStub
+        );
+        assert_eq!(
+            parse_registry_document(&key, br#"{"versions":{"1.0.0":{},"0.9.0":{}}}"#).unwrap(),
+            RegistryDocument::Versions(vec!["0.9.0".to_string(), "1.0.0".to_string()])
+        );
+        // Everything else must fail closed rather than be read as "no versions".
+        for body in [
+            br#"{}"#.as_slice(),
+            br#"{"error":"internal error"}"#,
+            br#"{"name":"ab-test-wordpress","error":"internal error"}"#,
+            br#"{"name":"ab-test-wordpress","modified":"2025-10-10T10:44:23.849Z","error":"internal error"}"#,
+            br#"{"name":"ab-test-wordpress","modified":"not-a-timestamp"}"#,
+            br#"{"name":"some-other-package","modified":"2025-10-10T10:44:23.849Z"}"#,
+            br#"{"_id":"ab-test-wordpress","name":"ab-test-wordpress","time":{"modified":"2025-10-10T10:44:23.849Z","unpublished":{"time":"2025-10-10T10:44:23.849Z","versions":["1.18.3"]}}}"#,
+            br#"{"_id":"ab-test-wordpress","name":"ab-test-wordpress","time":{"modified":"2025-10-10T10:44:23.849Z","unpublished":{"time":"2025-10-10T10:45:23.849Z","versions":["1.18.3"]}},"_rev":"2-b9dd1da47486cec5bb948497a8f1ba6d"}"#,
+            br#"{"_id":"ab-test-wordpress","name":"ab-test-wordpress","time":{"modified":"2025-10-10T10:44:23.849Z","unpublished":{"time":"2025-10-10T10:44:23.849Z","versions":[]}},"_rev":"2-b9dd1da47486cec5bb948497a8f1ba6d"}"#,
+            br#"{"name":"ab-test-wordpress","versions":{}}"#,
+            br#"{"versions":[]}"#,
+            br#"[]"#,
+            br#"not json"#,
+        ] {
+            assert!(
+                parse_registry_document(&key, body).is_err(),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        // PyPI has no unpublished stub: a missing `releases` object fails closed.
+        let pypi = RegistryPackageKey {
+            ecosystem: Ecosystem::PyPI,
+            name: "ab-test-wordpress".to_string(),
+        };
+        assert!(parse_registry_document(&pypi, br#"{"name":"ab-test-wordpress"}"#).is_err());
+        assert_eq!(
+            parse_registry_document(&pypi, br#"{"releases":{"1.0":{}}}"#).unwrap(),
+            RegistryDocument::Versions(vec!["1.0".to_string()])
+        );
+    }
+
+    #[test]
+    fn registry_not_found_bodies_must_be_the_registrys_own_document() {
+        assert!(registry_not_found_body_is_authentic(
+            Ecosystem::Npm,
+            br#"{"error":"Not found"}"#
+        ));
+        assert!(registry_not_found_body_is_authentic(
+            Ecosystem::PyPI,
+            br#"{"message": "Not Found"}"#
+        ));
+        for (ecosystem, body) in [
+            (Ecosystem::Npm, br#"<html>404</html>"#.as_slice()),
+            (Ecosystem::Npm, br#"{"message":"Not Found"}"#),
+            (Ecosystem::Npm, br#"{"error":"Not found","extra":1}"#),
+            (Ecosystem::PyPI, br#"{"error":"Not found"}"#),
+            (Ecosystem::Crates, br#"{"error":"Not found"}"#),
+            (Ecosystem::Npm, br#""#),
+        ] {
+            assert!(
+                !registry_not_found_body_is_authentic(ecosystem, body),
+                "{ecosystem}: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn registry_media_types_are_allowed_per_ecosystem_and_status() {
+        assert!(registry_media_type_is_allowed(
+            Ecosystem::Npm,
+            200,
+            NPM_REGISTRY_MEDIA_TYPE
+        ));
+        assert!(registry_media_type_is_allowed(
+            Ecosystem::Npm,
+            200,
+            JSON_MEDIA_TYPE
+        ));
+        assert!(registry_media_type_is_allowed(
+            Ecosystem::Npm,
+            404,
+            JSON_MEDIA_TYPE
+        ));
+        assert!(registry_media_type_is_allowed(
+            Ecosystem::PyPI,
+            200,
+            JSON_MEDIA_TYPE
+        ));
+        assert!(registry_media_type_is_allowed(
+            Ecosystem::PyPI,
+            404,
+            JSON_MEDIA_TYPE
+        ));
+        assert!(!registry_media_type_is_allowed(
+            Ecosystem::Npm,
+            404,
+            NPM_REGISTRY_MEDIA_TYPE
+        ));
+        assert!(!registry_media_type_is_allowed(
+            Ecosystem::PyPI,
+            200,
+            NPM_REGISTRY_MEDIA_TYPE
+        ));
+        assert!(!registry_media_type_is_allowed(
+            Ecosystem::Npm,
+            200,
+            "text/html"
+        ));
+        assert!(!registry_media_type_is_allowed(Ecosystem::Npm, 200, ""));
+        assert!(!registry_media_type_is_allowed(
+            Ecosystem::Npm,
+            500,
+            JSON_MEDIA_TYPE
+        ));
+        assert!(!registry_media_type_is_allowed(
+            Ecosystem::Crates,
+            200,
+            JSON_MEDIA_TYPE
+        ));
+    }
+
+    #[test]
+    fn registry_document_fetch_sends_accept_and_records_the_served_media_type() {
+        let mut server = mockito::Server::new();
+        let served = server
+            .mock("GET", "/lodash")
+            .match_header("accept", NPM_REGISTRY_MEDIA_TYPE)
+            .with_status(200)
+            .with_header(
+                "content-type",
+                "Application/VND.npm.install-v1+JSON; charset=utf-8",
+            )
+            .with_body(r#"{"versions":{"1.0.0":{}}}"#)
+            .create();
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let url = url::Url::parse(&format!("{}/lodash", server.url())).unwrap();
+        let (status, media_type, bytes) =
+            fetch_registry_document(&client, &url, NPM_REGISTRY_MEDIA_TYPE, "lodash").unwrap();
+        served.assert();
+        assert_eq!(status, 200);
+        assert_eq!(media_type, NPM_REGISTRY_MEDIA_TYPE);
+        assert_eq!(bytes, br#"{"versions":{"1.0.0":{}}}"#);
+
+        let _gone = server
+            .mock("GET", "/gone")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"Not found"}"#)
+            .create();
+        let url = url::Url::parse(&format!("{}/gone", server.url())).unwrap();
+        let (status, media_type, bytes) =
+            fetch_registry_document(&client, &url, NPM_REGISTRY_MEDIA_TYPE, "gone").unwrap();
+        assert_eq!((status, media_type.as_str()), (404, JSON_MEDIA_TYPE));
+        assert!(registry_not_found_body_is_authentic(Ecosystem::Npm, &bytes));
+
+        let _broken = server
+            .mock("GET", "/broken")
+            .with_status(503)
+            .with_body("try later")
+            .create();
+        let url = url::Url::parse(&format!("{}/broken", server.url())).unwrap();
+        let error =
+            fetch_registry_document(&client, &url, NPM_REGISTRY_MEDIA_TYPE, "broken").unwrap_err();
+        assert!(error.contains("returned 503"), "{error}");
+    }
+
+    #[test]
+    fn registry_snapshot_authenticates_package_unpublished_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot_path = directory.path().join("registry-versions.json");
+        let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
+        document["packages"][0]["resolution"] = serde_json::json!("package_unpublished");
+        document["packages"][0]["http_status"] = serde_json::json!(200);
+        document["packages"][0]["versions"] = serde_json::json!([]);
+        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let binding = fixture_snapshot_binding(&snapshot_path);
+        let mut store = RegistrySnapshotStore::load(&snapshot_path, &binding).unwrap();
+        let key = RegistryPackageKey {
+            ecosystem: Ecosystem::Npm,
+            name: "@solana/web3.js".to_string(),
+        };
+        assert!(matches!(
+            store.versions_for(&key).unwrap(),
+            RegistryVersionSet::PackageUnpublished
+        ));
+
+        for (field, value) in [
+            ("http_status", serde_json::json!(404)),
+            ("response_bytes", serde_json::json!(0)),
+            ("versions", serde_json::json!(["1.0.0"])),
+        ] {
+            let mut altered = document.clone();
+            altered["packages"][0][field] = value;
+            std::fs::write(&snapshot_path, serde_json::to_vec(&altered).unwrap()).unwrap();
+            let binding = fixture_snapshot_binding(&snapshot_path);
+            let error = RegistrySnapshotStore::load(&snapshot_path, &binding).unwrap_err();
+            assert!(
+                error.contains("inconsistent unpublished-package metadata")
+                    || error.contains("not strictly sorted")
+                    || error.contains("unexpected media type"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_open_range_without_a_pinned_comparator_fails_closed_before_any_request() {
+        // crates.io and Go have no pinned comparator and no registry fetcher.
+        // A non-zero open tail there must keep failing closed at projection
+        // time (as in the parent commit), never reaching the registry path.
+        for ecosystem in ["crates.io", "Go"] {
+            let directory = tempfile::tempdir().unwrap();
+            write_mal(
+                directory.path(),
+                "MAL-2099-0040.json",
+                &format!(
+                    r#"{{
+                        "id":"MAL-2099-0040",
+                        "affected":[{{
+                            "package":{{"ecosystem":"{ecosystem}","name":"open-package"}},
+                            "ranges":[{{"type":"SEMVER","events":[{{"introduced":"1.2.0"}}]}}]
+                        }}]
+                    }}"#
+                ),
+            );
+            let mut spy = SpyRegistryVersions::default();
+            let error = parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap_err();
+            assert!(
+                error.contains("unsupported_confirmed_shapes=1")
+                    && error.contains("not safely representable"),
+                "{ecosystem}: {error}"
+            );
+            assert!(
+                spy.calls.is_empty(),
+                "{ecosystem}: no registry request may be attempted"
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_open_range_requires_a_registry_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        write_open_tail_record(directory.path());
+        let error = parse_ossf(directory.path()).unwrap_err();
+        assert!(error.contains("requires --registry-snapshots"), "{error}");
     }
 
     #[test]
@@ -5620,8 +6530,12 @@ mod tests {
             parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
         assert_eq!(spy.calls, [key]);
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].all_versions_malicious);
-        assert_eq!(stats.registry_not_found_whole_claims, 1);
+        assert!(
+            entries[0].all_versions_malicious,
+            "[0, fixed) names no exact version, so an absent package is claimed whole"
+        );
+        assert_eq!(stats.registry_absent_whole_claims, 1);
+        assert_eq!(stats.registry_not_found_exact_claims, 0);
         assert_eq!(stats.bounded_intervals_materialized, 0);
     }
 
@@ -5659,7 +6573,50 @@ mod tests {
         assert!(!entries[0].all_versions_malicious);
         assert_eq!(entries[0].affected_versions, ["2.0.22", "2.0.27", "2.0.28"]);
         assert_eq!(stats.empty_registry_intervals_projected, 1);
+        assert_eq!(
+            stats.bounded_intervals_materialized, 0,
+            "an interval that matched no registry version was not materialized"
+        );
+    }
+
+    #[test]
+    fn source_boundaries_survive_even_when_the_registry_lists_only_later_versions() {
+        // npm removed the attacker's 2.0.27 but a later release inside the
+        // interval remains: the named boundary must still be claimed.
+        let directory = tempfile::tempdir().unwrap();
+        write_mal(
+            directory.path(),
+            "MAL-2099-0032.json",
+            r#"{
+                "id":"MAL-2099-0032",
+                "affected":[{
+                    "package":{"ecosystem":"npm","name":"partly-unpublished"},
+                    "ranges":[{"type":"SEMVER","events":[
+                        {"introduced":"2.0.27"},{"last_affected":"2.0.29"}
+                    ]}]
+                }]
+            }"#,
+        );
+        let key = RegistryPackageKey {
+            ecosystem: Ecosystem::Npm,
+            name: "partly-unpublished".to_string(),
+        };
+        let mut spy = SpyRegistryVersions::default();
+        spy.versions.insert(
+            key.clone(),
+            vec![
+                "2.0.26".to_string(),
+                "2.0.28".to_string(),
+                "2.0.30".to_string(),
+            ],
+        );
+        let (entries, stats, _) =
+            parse_ossf_with_provider(directory.path(), Some(&mut spy)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].all_versions_malicious);
+        assert_eq!(entries[0].affected_versions, ["2.0.27", "2.0.28", "2.0.29"]);
         assert_eq!(stats.bounded_intervals_materialized, 1);
+        assert_eq!(stats.empty_registry_intervals_projected, 0);
     }
 
     #[test]
@@ -6118,6 +7075,7 @@ mod tests {
         let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
         document["packages"][0]["resolution"] = serde_json::json!("package_not_found");
         document["packages"][0]["http_status"] = serde_json::json!(404);
+        document["packages"][0]["media_type"] = serde_json::json!(JSON_MEDIA_TYPE);
         document["packages"][0]["versions"] = serde_json::json!([]);
         std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
         let binding = fixture_snapshot_binding(&snapshot_path);
@@ -6131,12 +7089,18 @@ mod tests {
             RegistryVersionSet::PackageNotFound
         ));
 
-        document["packages"][0]["http_status"] = serde_json::json!(200);
-        std::fs::write(&snapshot_path, serde_json::to_vec(&document).unwrap()).unwrap();
-        let binding = fixture_snapshot_binding(&snapshot_path);
-        assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
-            .unwrap_err()
-            .contains("inconsistent not-found metadata"));
+        for (field, value) in [
+            ("http_status", serde_json::json!(200)),
+            ("response_bytes", serde_json::json!(0)),
+        ] {
+            let mut altered = document.clone();
+            altered["packages"][0][field] = value;
+            std::fs::write(&snapshot_path, serde_json::to_vec(&altered).unwrap()).unwrap();
+            let binding = fixture_snapshot_binding(&snapshot_path);
+            assert!(RegistrySnapshotStore::load(&snapshot_path, &binding)
+                .unwrap_err()
+                .contains("inconsistent not-found metadata"));
+        }
     }
 
     #[test]
