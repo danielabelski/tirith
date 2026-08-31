@@ -733,8 +733,11 @@ Examples:
         json: bool,
     },
 
-    /// Manage execution receipts
+    /// Manage download receipts recorded by `tirith run`
     #[command(after_help = "\
+Shows receipts for downloads performed via `tirith run` (URL, redirects,
+SHA-256). Shell execution receipts are a separate store with no CLI viewer.
+
 Examples:
   tirith receipt last
   tirith receipt list

@@ -472,7 +472,11 @@ fn write_human_color_into(
         if is_warn_only_block {
             writeln!(
                 w,
-                "  Safer: use an enter-capable shell (bash 5+/zsh/fish) to actually block this, or prefix with TIRITH=0 to suppress."
+                "  Safer: use zsh or fish to actually block this, or prefix with TIRITH=0 to suppress."
+            )?;
+            writeln!(
+                w,
+                "  Bash can block too: export TIRITH_BASH_PREEXEC_ENFORCE=1 before the tirith init line (remove any TIRITH_BASH_MODE=enter override)."
             )?;
         } else {
             writeln!(
@@ -890,7 +894,11 @@ fn write_human_no_color_into(
         if is_warn_only_block {
             writeln!(
                 w,
-                "  Safer: use an enter-capable shell (bash 5+/zsh/fish) to actually block this, or prefix with TIRITH=0 to suppress."
+                "  Safer: use zsh or fish to actually block this, or prefix with TIRITH=0 to suppress."
+            )?;
+            writeln!(
+                w,
+                "  Bash can block too: export TIRITH_BASH_PREEXEC_ENFORCE=1 before the tirith init line (remove any TIRITH_BASH_MODE=enter override)."
             )?;
         } else {
             writeln!(

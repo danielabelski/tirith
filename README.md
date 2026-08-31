@@ -1083,6 +1083,18 @@ allowlist_rules:
       - "get.docker.com"
 ```
 
+`allowlist` and `allowlist_rules` patterns match **only URLs** extracted from
+the input that appear in a finding's evidence. They never match raw command
+text, and a finding with no URL evidence can never be suppressed by an
+allowlist, so a command-shaped pattern like `launchctl list` is inert. Patterns
+use the same grammar as `tirith trust`: a pattern containing `://`, `/`, `?`,
+or `#` is an exact match on the normalized URL (anchored, query and fragment
+significant); a bare dotted host such as `get.docker.com` matches that domain
+and its subdomains; `*.example.com` is an explicit wildcard; a bare token
+without a dot is a substring match against the URL text. Inspect what a policy
+resolves to with `tirith policy effective`, and check a specific command with
+`tirith policy test '<command>'`.
+
 ### Managing trust from the CLI
 
 `tirith trust` manages trusted patterns without hand-editing policy YAML. Trust

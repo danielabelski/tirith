@@ -1975,14 +1975,13 @@ pub fn read_stdin_capped(max: u64) -> std::io::Result<Vec<u8>> {
 /// only for a REPO-scoped policy (the only untrusted scope) that actually had weakening
 /// fields dropped, and only when this session hasn't been warned yet (marker absent).
 /// Pure so the matrix is unit-testable without `state_dir()` I/O or process globals.
-fn should_warn_neutralized(
-    scope: tirith_core::policy::PolicyScope,
-    neutralized_fields: &[&str],
-    marker_exists: bool,
-) -> bool {
-    scope == tirith_core::policy::PolicyScope::Repo
-        && !neutralized_fields.is_empty()
-        && !marker_exists
+fn should_warn_neutralized(neutralized_fields: &[&str], marker_exists: bool) -> bool {
+    // Keyed on the drop set, NOT on `scope == Repo`: when a trusted user/org
+    // baseline exists, the merged policy keeps the baseline's scope while the
+    // repo overlay's dropped fields are still recorded, and the operator still
+    // deserves the notice. Only repo sanitization populates
+    // `neutralized_fields`, so this cannot fire for a purely trusted policy.
+    !neutralized_fields.is_empty() && !marker_exists
 }
 
 fn invalid_injection_seed_message(
@@ -2038,9 +2037,8 @@ pub fn warn_bad_injection_seeds(policy: &tirith_core::policy::Policy) {
 /// through `note()`/`--quiet`. `tirith policy effective` always lists the full drop
 /// set regardless of this throttle.
 pub fn warn_repo_policy_neutralized(policy: &tirith_core::policy::Policy) {
-    if policy.scope != tirith_core::policy::PolicyScope::Repo
-        || policy.neutralized_fields.is_empty()
-    {
+    // Scope is deliberately not consulted here; see `should_warn_neutralized`.
+    if policy.neutralized_fields.is_empty() {
         return;
     }
     // Throttle by SESSION id (so it re-warns in every new shell) + policy path —
@@ -2057,7 +2055,7 @@ pub fn warn_repo_policy_neutralized(policy: &tirith_core::policy::Policy) {
         format!("{:016x}", h.finish())
     };
     let marker = dir.join(format!("{session}-{path_key}"));
-    if !should_warn_neutralized(policy.scope, &policy.neutralized_fields, marker.exists()) {
+    if !should_warn_neutralized(&policy.neutralized_fields, marker.exists()) {
         return;
     }
     eprintln!(
@@ -2079,7 +2077,6 @@ mod tests {
     };
     use std::fs;
     use std::path::PathBuf;
-    use tirith_core::policy::PolicyScope;
 
     #[test]
     fn invalid_custom_seed_message_is_indexed_and_never_accepts_raw_pattern() {
@@ -2343,28 +2340,15 @@ mod tests {
     }
 
     #[test]
-    fn should_warn_neutralized_only_fires_for_repo_with_drops_and_no_marker() {
-        // Repo scope + something neutralized + no session marker → warn.
-        assert!(should_warn_neutralized(
-            PolicyScope::Repo,
-            &["allowlist"],
-            false
-        ));
+    fn should_warn_neutralized_fires_on_drops_regardless_of_merged_scope() {
+        // Something neutralized + no session marker → warn. The merged policy
+        // may carry the trusted baseline's User/Org scope while the repo
+        // overlay's drops are recorded, so scope is deliberately not consulted.
+        assert!(should_warn_neutralized(&["allowlist"], false));
         // Already warned this session (marker present) → silent.
-        assert!(!should_warn_neutralized(
-            PolicyScope::Repo,
-            &["allowlist"],
-            true
-        ));
-        // A non-repo (trusted) scope is never sanitized, so never warned — even with
-        // a (would-be) drop set and no marker.
-        assert!(!should_warn_neutralized(
-            PolicyScope::Org,
-            &["allowlist"],
-            false
-        ));
-        // Repo scope but nothing was neutralized → nothing to report.
-        assert!(!should_warn_neutralized(PolicyScope::Repo, &[], false));
+        assert!(!should_warn_neutralized(&["allowlist"], true));
+        // Nothing was neutralized → nothing to report.
+        assert!(!should_warn_neutralized(&[], false));
     }
 
     #[test]

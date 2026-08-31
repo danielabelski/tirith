@@ -2571,7 +2571,13 @@ fn print_human(info: &DoctorInfo) {
         };
         println!("  requested mode:       {requested_mode}");
         println!("  requested enforce:    {requested_enforce}");
-        println!("  require-enter:        {require_enter}");
+        if require_enter == "on" {
+            // Displayed honestly until a hook actually consumes the variable:
+            // nothing enforces require-enter semantics yet.
+            println!("  require-enter:        on (reserved; not enforced by this version)");
+        } else {
+            println!("  require-enter:        {require_enter}");
+        }
 
         match (
             info.bash_effective_mode.as_deref(),
@@ -2617,6 +2623,37 @@ fn print_human(info: &DoctorInfo) {
             }
             None => {
                 println!("  enter capability:     not tested — run tirith doctor --simulate-enter");
+            }
+        }
+        // Enter cannot block here: print the working bash blocking path
+        // (issue #224). Preexec enforcement arms only for shells that START
+        // in preexec mode, so a forced TIRITH_BASH_MODE=enter suppresses it.
+        let enter_blocked = matches!(
+            info.bash_enter_capability.as_deref(),
+            Some(verdict) if verdict != "works"
+        );
+        if enter_blocked {
+            let forced_enter = info
+                .bash_requested_mode
+                .as_deref()
+                .map(|mode| mode.eq_ignore_ascii_case("enter"))
+                .unwrap_or(false);
+            let enforce_armed = info
+                .bash_requested_enforce
+                .as_deref()
+                .map(env_is_truthy)
+                .unwrap_or(false);
+            if forced_enter || !enforce_armed {
+                println!("  to block on bash:     export TIRITH_BASH_PREEXEC_ENFORCE=1 before the");
+                println!(
+                    "                        'eval \"$(tirith init --shell bash)\"' line, then"
+                );
+                println!("                        start a new shell.");
+            }
+            if forced_enter {
+                println!("                        Also remove 'export TIRITH_BASH_MODE=enter': it");
+                println!("                        forces the broken enter mode, and preexec");
+                println!("                        enforcement never arms in a forced-enter shell.");
             }
         }
         if safe_mode_overridden_by_env(info.bash_safe_mode, info.bash_requested_mode.as_deref()) {

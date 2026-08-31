@@ -1,5 +1,15 @@
 use tirith_core::receipt::Receipt;
 
+fn print_no_receipts_hint() {
+    eprintln!("tirith: no download receipts found");
+    if let Some(dir) = tirith_core::policy::data_dir() {
+        eprintln!(
+            "  `tirith run` records download receipts under {}; shell execution receipts are a separate store",
+            dir.join("receipts").display()
+        );
+    }
+}
+
 pub fn last(json: bool) -> i32 {
     match Receipt::list() {
         Ok(receipts) => {
@@ -19,7 +29,7 @@ pub fn last(json: bool) -> i32 {
                 }
                 0
             } else {
-                eprintln!("tirith: no receipts found");
+                print_no_receipts_hint();
                 1
             }
         }
@@ -41,7 +51,7 @@ pub fn list(json: bool) -> i32 {
                 }
                 println!();
             } else if receipts.is_empty() {
-                eprintln!("tirith: no receipts found");
+                print_no_receipts_hint();
             } else {
                 for r in &receipts {
                     eprintln!(
