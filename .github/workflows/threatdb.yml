@@ -23,8 +23,8 @@ env:
   THREATDB_LEGACY_RELEASE_TAG: threatdb-latest
   # Reviewed immutable source revisions consumed and verified by the atomic
   # fetch transaction. Updating any pin is a source-review event.
-  THREATDB_OSSF_MP_REF: 1ea2762d5fb415aef003a244d5aa83c5fc48cc6e
-  THREATDB_DD_MP_REF: ef4a781d476cd6eb89c8517ff9adbb54a5cfa8cc
+  THREATDB_OSSF_MP_REF: 54642f7ee96e780b046660519b028fefb635375a
+  THREATDB_DD_MP_REF: 2d09839012cedc387ce438debeb77884ac2a242c
   THREATDB_TYPOSQUAT_REF: fd0bde98d200efe5c282a07edc4c68fba13252c6
 
 jobs:

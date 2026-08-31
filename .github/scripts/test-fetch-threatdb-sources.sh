@@ -16,11 +16,11 @@ FAKE_BIN="$TEST_ROOT/bin"
 OUTPUT_ROOT="$TEST_ROOT/output"
 mkdir -p -- "$FAKE_BIN" "$OUTPUT_ROOT"
 
-# The immutable OpenSSF revision currently contains 235,293 files totaling
-# 441,674,789 bytes. Guard the calibrated defaults so the reviewed snapshot
-# cannot silently become unbuildable again while both resource limits remain.
+# Guard the calibrated defaults so a reviewed OpenSSF snapshot cannot silently
+# become unbuildable again while both resource limits remain bounded.
 grep -Fq 'OSSF_MAX_FILES=250000' "$FETCH_SCRIPT"
 grep -Fq 'OSSF_MAX_BYTES=$((512 * 1024 * 1024))' "$FETCH_SCRIPT"
+grep -Fq 'FETCH_TIMEOUT_SECONDS=${THREATDB_FETCH_TIMEOUT_SECONDS:-300}' "$FETCH_SCRIPT"
 
 cat > "$FAKE_BIN/git" <<'EOF'
 #!/usr/bin/env bash
@@ -28,8 +28,8 @@ set -euo pipefail
 # `git -C <dir> rev-parse HEAD` records the resolved source revision.
 if [[ "$*" == *rev-parse* ]]; then
   case "$2" in
-    *ossf-mp) echo "1ea2762d5fb415aef003a244d5aa83c5fc48cc6e" ;;
-    *dd-mp) echo "ef4a781d476cd6eb89c8517ff9adbb54a5cfa8cc" ;;
+    *ossf-mp) echo "54642f7ee96e780b046660519b028fefb635375a" ;;
+    *dd-mp) echo "2d09839012cedc387ce438debeb77884ac2a242c" ;;
     *typosquats) echo "fd0bde98d200efe5c282a07edc4c68fba13252c6" ;;
     *) exit 64 ;;
   esac
@@ -59,6 +59,7 @@ case "$*" in
       printf '{"id":"MAL-2099-%04d","affected":[{"package":{"ecosystem":"npm","name":"bad-%d"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"}]}]}]}\n' \
         "$index" "$index" > "$destination/osv/MAL-2099-$(printf '%04d' "$index").json"
     done
+    ln -s MAL-2099-0001.json "$destination/osv/linked-record.json"
     ;;
   *DataDog/malicious-software-packages-dataset*)
     mkdir -p -- "$destination/samples/npm" "$destination/samples/pypi"
@@ -116,7 +117,7 @@ retrieved_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Two representative entries so the fetch script's per-package validator rules
 # (media type per ecosystem/status, resolution consistency) actually execute.
 cat > "$output" <<JSON
-{"schema_version":2,"ossf_commit":"1ea2762d5fb415aef003a244d5aa83c5fc48cc6e","retrieved_at":"$retrieved_at","packages":[
+{"schema_version":2,"ossf_commit":"54642f7ee96e780b046660519b028fefb635375a","retrieved_at":"$retrieved_at","packages":[
 {"ecosystem":"npm","name":"fake-live","source_url":"https://registry.npmjs.org/fake-live","media_type":"application/vnd.npm.install-v1+json","http_status":200,"resolution":"registry_versions","response_sha256":"1111111111111111111111111111111111111111111111111111111111111111","response_bytes":64,"versions":["1.0.0","1.0.1"]},
 {"ecosystem":"npm","name":"fake-gone","source_url":"https://registry.npmjs.org/fake-gone","media_type":"application/json","http_status":404,"resolution":"package_not_found","response_sha256":"2222222222222222222222222222222222222222222222222222222222222222","response_bytes":21,"versions":[]}
 ]}
@@ -205,13 +206,25 @@ esac
 "$@" &
 child=$!
 (
-  sleep "$duration"
+  sleeper=
+  cleanup_watchdog() {
+    if [ -n "$sleeper" ]; then
+      kill "$sleeper" 2>/dev/null || true
+      sleeper=
+    fi
+  }
+  trap 'cleanup_watchdog; exit 0' TERM INT
+  trap cleanup_watchdog EXIT
+  sleep "$duration" &
+  sleeper=$!
+  wait "$sleeper" || exit 0
+  sleeper=
   kill -TERM "$child" 2>/dev/null || exit 0
   # Give the fake worker's TERM trap time to record graceful termination even
   # on loaded macOS runners before exercising the hard-kill fallback.
   sleep 1
   kill -KILL "$child" 2>/dev/null || true
-) &
+) </dev/null >/dev/null 2>&1 &
 watchdog=$!
 wait "$child"
 status=$?
@@ -600,7 +613,7 @@ test -s "$published/typosquats/typosquats.csv"
 
 # The resolved upstream revisions must be recorded on the success path only.
 test -s "$published/source-provenance.json"
-grep -Eq '"commit"[[:space:]]*:[[:space:]]*"1ea2762d5fb415aef003a244d5aa83c5fc48cc6e"' \
+grep -Eq '"commit"[[:space:]]*:[[:space:]]*"54642f7ee96e780b046660519b028fefb635375a"' \
   "$published/source-provenance.json"
 grep -Eq '"compiler_version"[[:space:]]*:[[:space:]]*"0.3.3"' \
   "$published/source-provenance.json"
@@ -622,6 +635,28 @@ grep -Eq '"content_sha256"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"' \
   "$published/source-provenance.json"
 grep -Eq '"retrieved_at"[[:space:]]*:[[:space:]]*"[0-9]{4}-[0-9]{2}-[0-9]{2}T' \
   "$published/source-provenance.json"
+
+# The single-process tree hasher must remain byte-for-byte compatible with the
+# original path-NUL/file-digest-NUL stream format consumed by published source
+# provenance. The fixture is intentionally small enough for the legacy oracle.
+expected_ossf_digest=$(
+  cd -- "$published/ossf-mp"
+  find osv -type f -print0 \
+    | LC_ALL=C sort -z \
+    | while IFS= read -r -d '' file; do
+        printf '%s\0' "$file"
+        sha256sum "$file" | cut -d' ' -f1 | tr -d '\n'
+        printf '\0'
+      done \
+    | sha256sum \
+    | cut -d' ' -f1
+)
+actual_ossf_digest=$(jq -r '.ossf_malicious_packages.content_sha256' \
+  "$published/source-provenance.json")
+if [ "$actual_ossf_digest" != "$expected_ossf_digest" ]; then
+  echo "single-process content digest is not provenance-compatible: expected $expected_ossf_digest, got $actual_ossf_digest" >&2
+  exit 1
+fi
 
 # Provenance retention follows the union of retained/protected database
 # generations. Generation 20 survives through its protected v1 DB; generation
