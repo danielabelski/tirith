@@ -7607,8 +7607,8 @@ fn update_rollback_refused_for_non_self_managed() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("--rollback only applies to a self-managed"),
-        "rollback should explain the self-managed restriction, got: {stdout}"
+        stdout.contains("--rollback only applies to a self-replaceable"),
+        "rollback should explain the self-replaceable restriction, got: {stdout}"
     );
 }
 
@@ -7717,6 +7717,107 @@ fn update_rollback_self_managed_restores_previous_binary() {
     assert!(
         !backup.exists(),
         "the consumed rollback backup should be removed after a successful rollback"
+    );
+}
+
+/// A Tirith release binary cached by Hermes is not package-manager state. Once
+/// the exact private path and ownership are proven, it reports `hermes` and may
+/// use the same signed/atomic self-update and rollback machinery as a standalone
+/// install. This real child-process rollback proves the filesystem boundary and
+/// performs no network request.
+#[cfg(unix)]
+#[test]
+fn update_rollback_hermes_managed_restores_previous_binary() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let hermes_home = directory.path().join("hermes-home");
+    let bin_dir = hermes_home.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let live = bin_dir.join("tirith");
+    fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();
+    fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let provenance = run_freshly_written_binary(
+        Command::new(&live)
+            .args(["version", "--provenance", "--format", "json"])
+            .env("HERMES_HOME", &hermes_home)
+            .env_remove("TIRITH"),
+    );
+    assert_eq!(
+        provenance.status.code(),
+        Some(0),
+        "Hermes provenance should succeed: {}",
+        String::from_utf8_lossy(&provenance.stderr)
+    );
+    let provenance_json: serde_json::Value =
+        serde_json::from_slice(&provenance.stdout).expect("provenance JSON should parse");
+    assert_eq!(provenance_json["install_method"], "hermes");
+
+    let backup = bin_dir.join("tirith.tirith-previous");
+    let sentinel = b"PREVIOUS-HERMES-TIRITH-SENTINEL";
+    fs::write(&backup, sentinel).unwrap();
+    let rollback = run_freshly_written_binary(
+        Command::new(&live)
+            .args(["update", "--rollback", "--yes", "--format", "json"])
+            .env("HERMES_HOME", &hermes_home)
+            .env_remove("TIRITH"),
+    );
+    assert_eq!(
+        rollback.status.code(),
+        Some(0),
+        "Hermes rollback should succeed without a privileged helper: {}",
+        String::from_utf8_lossy(&rollback.stderr)
+    );
+    let rollback_json: serde_json::Value =
+        serde_json::from_slice(&rollback.stdout).expect("rollback JSON should parse");
+    assert_eq!(rollback_json["action"], "rolled-back");
+    assert_eq!(fs::read(&live).unwrap(), sentinel);
+    assert!(!backup.exists(), "the consumed backup should be removed");
+}
+
+/// `cargo install --root` writes metadata beside its `bin` directory. Even if
+/// that root is also named by `HERMES_HOME`, Tirith must preserve Cargo's
+/// package state and refuse Hermes self-replacement authority.
+#[cfg(unix)]
+#[test]
+fn update_rollback_hermes_path_with_cargo_metadata_is_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let hermes_home = directory.path().join("cargo-root");
+    let bin_dir = hermes_home.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::write(hermes_home.join(".crates.toml"), b"[v1]").unwrap();
+    let live = bin_dir.join("tirith");
+    fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();
+    fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let provenance = run_freshly_written_binary(
+        Command::new(&live)
+            .args(["version", "--provenance", "--format", "json"])
+            .env("HERMES_HOME", &hermes_home)
+            .env_remove("TIRITH"),
+    );
+    assert_eq!(provenance.status.code(), Some(0));
+    let provenance_json: serde_json::Value =
+        serde_json::from_slice(&provenance.stdout).expect("provenance JSON should parse");
+    assert_ne!(provenance_json["install_method"], "hermes");
+
+    let original = fs::read(&live).unwrap();
+    let backup = bin_dir.join("tirith.tirith-previous");
+    fs::write(&backup, b"CARGO-OWNED-BACKUP").unwrap();
+    let rollback = run_freshly_written_binary(
+        Command::new(&live)
+            .args(["update", "--rollback", "--yes", "--format", "json"])
+            .env("HERMES_HOME", &hermes_home)
+            .env_remove("TIRITH"),
+    );
+    assert_eq!(rollback.status.code(), Some(1));
+    assert_eq!(fs::read(&live).unwrap(), original);
+    assert!(
+        backup.exists(),
+        "a refused rollback must not consume the backup"
     );
 }
 

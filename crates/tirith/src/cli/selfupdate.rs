@@ -159,8 +159,243 @@ fn prepare_self_authorization_with_policy<B: tirith_core::task_boundary::Boundar
     })
 }
 
-/// Gather the running binary's provenance without any network access.
-pub fn gather_provenance() -> Provenance {
+/// System and package-manager roots must never gain self-replacement authority
+/// merely because `HERMES_HOME` names them.
+#[cfg(unix)]
+fn hermes_root_is_denied(root: &Path) -> bool {
+    let denied_exact = [
+        "/",
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/System",
+        "/Library",
+        "/Applications",
+        "/opt/homebrew",
+        "/home/linuxbrew/.linuxbrew",
+        "/nix",
+    ];
+    denied_exact.iter().any(|denied| root == Path::new(denied))
+        || root.starts_with("/nix/store")
+        || root.starts_with("/nix/var/nix/profiles")
+        || root.starts_with("/opt/homebrew/Cellar")
+        || root.starts_with("/home/linuxbrew/.linuxbrew/Cellar")
+}
+
+/// Resolve the one Hermes data root whose private cached binary may be treated
+/// as self-replaceable. An explicit `HERMES_HOME` wins; otherwise Hermes uses
+/// `~/.hermes`. The root must already be an absolute, lexically-normal path and
+/// must not be a system/package-manager root.
+#[cfg(unix)]
+fn configured_hermes_root(
+    configured: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let root = match configured {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        Some(_) => return None,
+        None => home?.join(".hermes"),
+    };
+    if !root.is_absolute() {
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in root.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    // Reject aliases such as `/safe/./root` instead of silently granting a
+    // different spelling authority over the running executable.
+    if normalized.as_os_str() != root.as_os_str() {
+        return None;
+    }
+
+    if hermes_root_is_denied(&root) {
+        return None;
+    }
+    Some(root)
+}
+
+#[cfg(unix)]
+fn hermes_owned_directory(path: &Path, effective_uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_dir()
+            && metadata.uid() == effective_uid
+            && metadata.mode() & 0o022 == 0
+    })
+}
+
+#[cfg(unix)]
+fn hermes_owned_executable(path: &Path, effective_uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_file()
+            && metadata.uid() == effective_uid
+            && metadata.mode() & 0o022 == 0
+            && metadata.mode() & 0o111 != 0
+    })
+}
+
+#[cfg(unix)]
+fn cargo_install_metadata_exists(root: &Path) -> bool {
+    [".crates.toml", ".crates2.json"]
+        .iter()
+        .any(|name| std::fs::symlink_metadata(root.join(name)).is_ok())
+}
+
+/// Prove that the running canonical executable is exactly a safely owned Hermes
+/// release cache. Every traversed directory and the executable must be
+/// same-UID, non-symlink, and not group/world-writable.
+#[cfg(unix)]
+fn hermes_install_path_is_proven(canonical_binary: &Path, root: Option<&Path>) -> bool {
+    use std::path::Component;
+
+    if !canonical_binary.is_absolute() {
+        return false;
+    }
+    let Some(root) = root else {
+        return false;
+    };
+    // SAFETY: geteuid has no preconditions and does not mutate memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !hermes_owned_directory(root, effective_uid) {
+        return false;
+    }
+    let Ok(canonical_root) = root.canonicalize() else {
+        return false;
+    };
+    if hermes_root_is_denied(&canonical_root) {
+        return false;
+    }
+    let Ok(relative) = canonical_binary.strip_prefix(&canonical_root) else {
+        return false;
+    };
+    let components = relative.components().collect::<Vec<_>>();
+
+    let (candidate, directories, cargo_root) = match components.as_slice() {
+        [Component::Normal(bin), Component::Normal(binary)]
+            if *bin == std::ffi::OsStr::new("bin") && *binary == std::ffi::OsStr::new("tirith") =>
+        {
+            (
+                root.join("bin").join("tirith"),
+                vec![root.join("bin")],
+                root.to_path_buf(),
+            )
+        }
+        [Component::Normal(profiles), Component::Normal(profile), Component::Normal(bin), Component::Normal(binary)]
+            if *profiles == std::ffi::OsStr::new("profiles")
+                && *bin == std::ffi::OsStr::new("bin")
+                && *binary == std::ffi::OsStr::new("tirith") =>
+        {
+            let profiles = root.join("profiles");
+            let profile = profiles.join(profile);
+            (
+                profile.join("bin").join("tirith"),
+                vec![profiles, profile.clone(), profile.join("bin")],
+                profile,
+            )
+        }
+        _ => return false,
+    };
+
+    !cargo_install_metadata_exists(&cargo_root)
+        && directories
+            .iter()
+            .all(|directory| hermes_owned_directory(directory, effective_uid))
+        && hermes_owned_executable(&candidate, effective_uid)
+        && candidate.canonicalize().ok().as_deref() == Some(canonical_binary)
+}
+
+fn proven_hermes_root_from_environment(canonical_binary: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        let configured = std::env::var_os("HERMES_HOME");
+        let root = configured_hermes_root(configured.as_deref(), home::home_dir().as_deref());
+        if hermes_install_path_is_proven(canonical_binary, root.as_deref()) {
+            root
+        } else {
+            None
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = canonical_binary;
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CliInstallOrigin {
+    Standard,
+    Hermes { root: PathBuf },
+}
+
+/// CLI-private install context. Hermes deliberately remains outside the public
+/// `tirith-core` enum for patch-release compatibility, while this stable origin
+/// prevents a failed later re-proof from falling through to generic privileged
+/// `SelfManaged` behavior.
+#[derive(Debug, Clone)]
+struct CliProvenance {
+    core: Provenance,
+    origin: CliInstallOrigin,
+}
+
+impl CliProvenance {
+    fn is_hermes_managed(&self) -> bool {
+        matches!(&self.origin, CliInstallOrigin::Hermes { .. })
+    }
+
+    fn hermes_install_still_proven(&self) -> bool {
+        if self.core.path_resolution_failed {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            match (&self.origin, self.core.binary_path.as_deref()) {
+                (CliInstallOrigin::Hermes { root }, Some(binary)) => {
+                    hermes_install_path_is_proven(binary, Some(root))
+                }
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+impl std::ops::Deref for CliProvenance {
+    type Target = Provenance;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+fn install_method_token(provenance: &CliProvenance) -> &'static str {
+    if provenance.is_hermes_managed() {
+        "hermes"
+    } else {
+        provenance.core.install_method.as_str()
+    }
+}
+
+fn gather_cli_provenance() -> CliProvenance {
     let raw_exe = std::env::current_exe().ok();
     // Resolve through symlinks / npm wrapper / Scoop shim so the install-method
     // classifier sees the real on-disk binary.
@@ -175,25 +410,41 @@ pub fn gather_provenance() -> Provenance {
 
     let binary_sha256 = binary_path.as_deref().and_then(hash_file_opt);
 
-    let install_method = match &binary_path {
+    let (install_method, origin) = match &binary_path {
         Some(p) => {
             let m = selfupdate::detect_install_method(p);
-            selfupdate::refine_system_pm(m, &read_os_release_ids())
+            let hermes_root = (!path_resolution_failed && m == InstallMethod::Unknown)
+                .then(|| proven_hermes_root_from_environment(p))
+                .flatten();
+            if let Some(root) = hermes_root {
+                (
+                    InstallMethod::SelfManaged,
+                    CliInstallOrigin::Hermes { root },
+                )
+            } else {
+                (
+                    selfupdate::refine_system_pm(m, &read_os_release_ids()),
+                    CliInstallOrigin::Standard,
+                )
+            }
         }
-        None => InstallMethod::Unknown,
+        None => (InstallMethod::Unknown, CliInstallOrigin::Standard),
     };
 
     let dev_build =
         selfupdate::looks_like_dev_build(binary_path.as_deref(), cfg!(debug_assertions));
 
-    Provenance {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        binary_path,
-        binary_sha256,
-        target: selfupdate::release_target_triple().map(|s| s.to_string()),
-        install_method,
-        dev_build,
-        path_resolution_failed,
+    CliProvenance {
+        core: Provenance {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            binary_path,
+            binary_sha256,
+            target: selfupdate::release_target_triple().map(|s| s.to_string()),
+            install_method,
+            dev_build,
+            path_resolution_failed,
+        },
+        origin,
     }
 }
 
@@ -211,7 +462,7 @@ pub fn version(provenance: bool, json: bool) -> i32 {
         return 0;
     }
 
-    let prov = gather_provenance();
+    let prov = gather_cli_provenance();
     // Offline: reports local facts and a local-only verdict. Full networked
     // verification is `verify-self`.
     let local_status = local_verification_status(&prov);
@@ -222,7 +473,7 @@ pub fn version(provenance: bool, json: bool) -> i32 {
             "binary_path": prov.binary_path.as_ref().map(|p| p.display().to_string()),
             "binary_sha256": prov.binary_sha256,
             "target": prov.target,
-            "install_method": prov.install_method.as_str(),
+            "install_method": install_method_token(&prov),
             "install_method_resolved": !prov.path_resolution_failed,
             "dev_build": prov.dev_build,
             "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
@@ -260,7 +511,7 @@ pub fn version(provenance: bool, json: bool) -> i32 {
         if let Some(sha) = &prov.binary_sha256 {
             println!("  sha256:          {sha}");
         }
-        println!("  install method:  {}", prov.install_method.as_str());
+        println!("  install method:  {}", install_method_token(&prov));
         if prov.path_resolution_failed {
             println!(
                 "  note:            the binary path could not be fully resolved; the install \
@@ -393,8 +644,8 @@ impl VerifySelfOutcome {
 /// (dev build, offline, unpublished platform); `1` on a FAILED verification
 /// (mismatch / bad signature), an operational error, or a JSON serialize failure.
 pub fn verify_self(json: bool) -> i32 {
-    let prov = gather_provenance();
-    let outcome = run_verify_self(&prov);
+    let prov = gather_cli_provenance();
+    let outcome = run_verify_self(&prov, prov.is_hermes_managed());
     let emit_rc = emit_verify_self(
         &prov,
         &outcome.status,
@@ -416,7 +667,7 @@ pub fn verify_self(json: bool) -> i32 {
 /// apply, so return an honest `Unverified` reason instead of a false `Failed`:
 /// `cargo install` and the AUR compile from source. Returns `None` for installs
 /// that DO ship the canonical release binary (`.deb`/apt, `.rpm`/dnf,
-/// self-managed, Homebrew, npm, Scoop) and must verify normally. Exhaustive (no
+/// self-managed, Hermes, Homebrew, npm, Scoop) and must verify normally. Exhaustive (no
 /// `_`) so a new install method forces a deliberate decision here. The release
 /// workflow byte-compares both RPM executables against the canonical GNU
 /// tarball before publishing, so DNF must never be carved out here again.
@@ -448,7 +699,7 @@ fn source_built_unverified_reason(method: &InstallMethod) -> Option<String> {
 /// (distributed as a bottle), so its binary is not the prebuilt release artifact,
 /// while the `sheeki03/tap` formula pours the prebuilt binary and matches above
 /// (VERIFIED). Every other method that reaches here ships the canonical prebuilt
-/// binary (.deb/apt, .rpm/dnf, npm, Scoop, self-managed), so for them a mismatch
+/// binary (.deb/apt, .rpm/dnf, npm, Scoop, self-managed, Hermes), so for them a mismatch
 /// IS tampering and stays `Failed`; the always-source-built methods (cargo/aur) are
 /// pre-empted before the network fetch by `source_built_unverified_reason` and
 /// never reach here. Exhaustive (no `_`) so a new method forces a decision.
@@ -474,7 +725,10 @@ fn benign_mismatch_reason(method: &InstallMethod) -> Option<String> {
 
 /// Core of `verify-self`: the networked verification, kept separate so the
 /// emit/exit logic is trivially correct.
-fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
+fn run_verify_self(prov: &Provenance, hermes_managed: bool) -> VerifySelfOutcome {
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let _ = hermes_managed;
+
     // 1. A dev build can never be matched against a release.
     if prov.dev_build {
         return VerifySelfOutcome::verdict(VerificationStatus::Unverified {
@@ -689,7 +943,8 @@ fn run_verify_self(prov: &Provenance) -> VerifySelfOutcome {
     let helper_note: Option<String> = None;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if let Err(reason) = verify_installed_package_approval_helper(workdir.path(), &target) {
-        if install_method_requires_package_approval_helper(&prov.install_method) {
+        if install_method_requires_package_approval_helper(&prov.install_method) && !hermes_managed
+        {
             return VerifySelfOutcome::verdict(VerificationStatus::Failed { reason });
         }
         helper_note = Some(format!(
@@ -746,7 +1001,7 @@ fn verify_installed_package_approval_helper(workdir: &Path, target: &str) -> Res
 /// `0` otherwise (the verdict-based exit code is the caller's). `detail_override`,
 /// when `Some`, is a more precise `verification_detail` than [`status_detail`].
 fn emit_verify_self(
-    prov: &Provenance,
+    prov: &CliProvenance,
     status: &VerificationStatus,
     detail_override: Option<&str>,
     json: bool,
@@ -757,7 +1012,7 @@ fn emit_verify_self(
             "version": prov.version,
             "binary_path": prov.binary_path.as_ref().map(|p| p.display().to_string()),
             "binary_sha256": prov.binary_sha256,
-            "install_method": prov.install_method.as_str(),
+            "install_method": install_method_token(prov),
             "install_method_resolved": !prov.path_resolution_failed,
             "target": prov.target,
             "dev_build": prov.dev_build,
@@ -786,7 +1041,7 @@ fn emit_verify_self(
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "unknown".to_string())
     );
-    println!("  install method: {}", prov.install_method.as_str());
+    println!("  install method: {}", install_method_token(prov));
     if prov.path_resolution_failed {
         println!(
             "  note:           the binary path could not be fully resolved; the install method \
@@ -842,13 +1097,13 @@ fn emit_verify_self(
 /// * `allow_unsigned` — permit a checksum-only update when the cosign signature
 ///   cannot be verified. By default the signature is MANDATORY and the update
 ///   aborts without it (a checksum mismatch always aborts, regardless).
-/// * `rollback` — revert to the previously-installed version (self-managed
+/// * `rollback` — revert to the previously-installed version (self-replaceable
 ///   installs only).
 /// * `dry_run` — show what would happen, change nothing.
 ///
 /// Exit `0` on success or a clean no-op, `1` on any failure.
 pub fn update(allow_unsigned: bool, rollback: bool, dry_run: bool, yes: bool, json: bool) -> i32 {
-    let prov = gather_provenance();
+    let prov = gather_cli_provenance();
 
     if rollback {
         return run_rollback(&prov, dry_run, yes, json);
@@ -857,8 +1112,61 @@ pub fn update(allow_unsigned: bool, rollback: bool, dry_run: bool, yes: bool, js
     run_update(&prov, allow_unsigned, dry_run, yes, json)
 }
 
+fn update_effects(
+    method: &InstallMethod,
+    hermes_managed: bool,
+    dry_run: bool,
+) -> BTreeSet<tirith_core::effects::CommandEffectKind> {
+    let mut effects = [tirith_core::effects::CommandEffectKind::NetworkEgress]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if !dry_run {
+        effects.insert(tirith_core::effects::CommandEffectKind::FilesystemWrite);
+        if install_method_updates_privileged_helper(method, hermes_managed) {
+            effects.insert(tirith_core::effects::CommandEffectKind::ResourceEscalation);
+        }
+    }
+    effects
+}
+
+fn rollback_effects(
+    method: &InstallMethod,
+    hermes_managed: bool,
+) -> BTreeSet<tirith_core::effects::CommandEffectKind> {
+    let mut effects = [tirith_core::effects::CommandEffectKind::FilesystemWrite]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if install_method_updates_privileged_helper(method, hermes_managed) {
+        effects.insert(tirith_core::effects::CommandEffectKind::ResourceEscalation);
+    }
+    effects
+}
+
+fn install_method_updates_privileged_helper(method: &InstallMethod, hermes_managed: bool) -> bool {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        !hermes_managed && install_method_requires_package_approval_helper(method)
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = (method, hermes_managed);
+        false
+    }
+}
+
+fn ensure_hermes_install_still_proven(provenance: &CliProvenance) -> Result<(), String> {
+    if !provenance.is_hermes_managed() || provenance.hermes_install_still_proven() {
+        return Ok(());
+    }
+    Err(
+        "the Hermes install boundary changed after it was classified; refusing to modify the \
+         binary. Restore the original ownership, permissions, and path, then retry"
+            .to_string(),
+    )
+}
+
 fn run_update(
-    prov: &Provenance,
+    prov: &CliProvenance,
     allow_unsigned: bool,
     dry_run: bool,
     yes: bool,
@@ -868,8 +1176,12 @@ fn run_update(
     if !prov.install_method.is_self_replaceable() {
         return advise_package_manager(prov, json);
     }
+    if let Err(error) = ensure_hermes_install_still_proven(prov) {
+        emit_update_error(json, &error);
+        return 1;
+    }
 
-    // Self-managed install: tirith owns the binary and may replace it.
+    // A proven self-replaceable install: tirith owns the binary and may replace it.
     let current = match SemVer::parse(&prov.version) {
         Some(v) => v,
         None => {
@@ -910,14 +1222,8 @@ fn run_update(
         }
     };
     let expected_rollback_sha = hash_file_opt(&previous_backup_path(&binary_path));
-    let mut effects = [tirith_core::effects::CommandEffectKind::NetworkEgress]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    if !dry_run {
-        effects.insert(tirith_core::effects::CommandEffectKind::FilesystemWrite);
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        effects.insert(tirith_core::effects::CommandEffectKind::ResourceEscalation);
-    }
+    let hermes_managed = prov.is_hermes_managed();
+    let effects = update_effects(&prov.install_method, hermes_managed, dry_run);
     let authorization =
         match prepare_self_authorization::<tirith_core::task_boundary::SelfUpdateBoundary>(
             match self_boundary_envelope(
@@ -991,7 +1297,7 @@ fn run_update(
                 "action": "would-update",
                 "current_version": current.to_string(),
                 "latest_version": latest.to_string(),
-                "install_method": prov.install_method.as_str(),
+                "install_method": install_method_token(prov),
                 "binary_path": binary_path.display().to_string(),
                 "allow_unsigned": allow_unsigned,
             });
@@ -1120,8 +1426,17 @@ fn run_update(
             return 1;
         }
     };
+    // Hermes is a CLI-private subtype of `SelfManaged`. Its stable origin
+    // always suppresses privileged-helper behavior, while a changed filesystem
+    // proof aborts instead of downgrading into generic self-management.
+    if let Err(error) = ensure_hermes_install_still_proven(prov) {
+        emit_update_error(json, &error);
+        return 1;
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let helper_install = {
+    let helper_install = if !hermes_managed
+        && install_method_requires_package_approval_helper(&prov.install_method)
+    {
         let archive_sha256 = match &archive_verdict {
             ArchiveVerdict::Ok { archive_sha256, .. } => archive_sha256,
             _ => unreachable!("failed archive verdict returned above"),
@@ -1140,6 +1455,8 @@ fn run_update(
                 return 1;
             }
         }
+    } else {
+        None
     };
 
     // 5. Atomic swap, keeping the previous binary for rollback.
@@ -1279,24 +1596,29 @@ fn advise_package_manager(prov: &Provenance, json: bool) -> i32 {
 }
 
 /// `tirith update --rollback`. Restore the previous binary saved by the last
-/// self-managed update. Only valid for a self-managed install.
-fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 {
+/// self-update. Only valid for a proven self-replaceable install.
+fn run_rollback(prov: &CliProvenance, dry_run: bool, yes: bool, json: bool) -> i32 {
     if !prov.install_method.is_self_replaceable() {
         let msg = format!(
-            "--rollback only applies to a self-managed (install.sh / standalone) install; \
+            "--rollback only applies to a self-replaceable (install.sh / standalone / \
+             Hermes-managed) install; \
              this is a `{}` install. Use the package manager to install a previous version.",
-            prov.install_method.as_str()
+            install_method_token(prov)
         );
         if json {
             let v = serde_json::json!({
                 "action": "rollback-unavailable",
-                "install_method": prov.install_method.as_str(),
+                "install_method": install_method_token(prov),
                 "message": msg,
             });
             println!("{v}");
         } else {
             println!("tirith: {msg}");
         }
+        return 1;
+    }
+    if let Err(error) = ensure_hermes_install_still_proven(prov) {
+        emit_update_error(json, &error);
         return 1;
     }
 
@@ -1369,13 +1691,8 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
             return 1;
         }
     };
-    let effects = [
-        tirith_core::effects::CommandEffectKind::FilesystemWrite,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        tirith_core::effects::CommandEffectKind::ResourceEscalation,
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
+    let hermes_managed = prov.is_hermes_managed();
+    let effects = rollback_effects(&prov.install_method, hermes_managed);
     let authorization =
         match prepare_self_authorization::<tirith_core::task_boundary::SelfUpdateBoundary>(
             match self_boundary_envelope(
@@ -1405,10 +1722,17 @@ fn run_rollback(prov: &Provenance, dry_run: bool, yes: bool, json: bool) -> i32 
             }
         };
 
+    if let Err(error) = ensure_hermes_install_still_proven(prov) {
+        emit_update_error(json, &error);
+        return 1;
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let helper_restore = if Path::new(PACKAGE_APPROVAL_HELPER_PATH).is_file()
-        || Path::new(PACKAGE_APPROVAL_HELPER_BACKUP).is_file()
-        || Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT).is_file()
+    let helper_restore = if !hermes_managed
+        && install_method_requires_package_approval_helper(&prov.install_method)
+        && (Path::new(PACKAGE_APPROVAL_HELPER_PATH).is_file()
+            || Path::new(PACKAGE_APPROVAL_HELPER_BACKUP).is_file()
+            || Path::new(PACKAGE_APPROVAL_HELPER_PREVIOUSLY_ABSENT).is_file())
     {
         use std::ffi::OsStr;
         let had_previous = Path::new(PACKAGE_APPROVAL_HELPER_BACKUP).is_file();
@@ -3021,6 +3345,191 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn write_owned_test_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::write(path, b"test-tirith").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermes_root_must_be_absolute_normalized_and_outside_system_roots() {
+        assert_eq!(
+            configured_hermes_root(None, Some(Path::new("/home/alice"))),
+            Some(PathBuf::from("/home/alice/.hermes"))
+        );
+        assert_eq!(
+            configured_hermes_root(Some(std::ffi::OsStr::new("/opt/data")), None),
+            Some(PathBuf::from("/opt/data"))
+        );
+        for rejected in [
+            "",
+            "relative/hermes",
+            "/tmp/../usr/local",
+            "/usr/local",
+            "/nix/store/immutable-hermes",
+            "/opt/homebrew/Cellar/tirith",
+        ] {
+            assert_eq!(
+                configured_hermes_root(Some(std::ffi::OsStr::new(rejected)), None),
+                None,
+                "unsafe Hermes root must be refused: {rejected}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermes_install_proof_accepts_only_exact_owned_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("hermes");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let direct = bin.join("tirith");
+        write_owned_test_executable(&direct);
+        let canonical_direct = direct.canonicalize().unwrap();
+
+        assert!(hermes_install_path_is_proven(
+            &canonical_direct,
+            Some(root.as_path())
+        ));
+
+        let profile_bin = root.join("profiles").join("default").join("bin");
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        let profile = profile_bin.join("tirith");
+        write_owned_test_executable(&profile);
+        assert!(hermes_install_path_is_proven(
+            &profile.canonicalize().unwrap(),
+            Some(root.as_path())
+        ));
+
+        let outside = directory.path().join("tirith");
+        write_owned_test_executable(&outside);
+        assert!(!hermes_install_path_is_proven(
+            &outside.canonicalize().unwrap(),
+            Some(root.as_path())
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermes_install_proof_rejects_writable_or_symlinked_boundaries() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let writable_root = directory.path().join("writable-hermes");
+        let writable_bin = writable_root.join("bin");
+        std::fs::create_dir_all(&writable_bin).unwrap();
+        let writable_binary = writable_bin.join("tirith");
+        write_owned_test_executable(&writable_binary);
+        std::fs::set_permissions(&writable_bin, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(!hermes_install_path_is_proven(
+            &writable_binary.canonicalize().unwrap(),
+            Some(writable_root.as_path())
+        ));
+
+        let symlink_root = directory.path().join("symlink-hermes");
+        let real_bin = directory.path().join("real-bin");
+        std::fs::create_dir_all(&symlink_root).unwrap();
+        std::fs::create_dir_all(&real_bin).unwrap();
+        let real_binary = real_bin.join("tirith");
+        write_owned_test_executable(&real_binary);
+        symlink(&real_bin, symlink_root.join("bin")).unwrap();
+        assert!(!hermes_install_path_is_proven(
+            &real_binary.canonicalize().unwrap(),
+            Some(symlink_root.as_path())
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermes_install_proof_rejects_direct_and_profile_cargo_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("hermes");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let direct = bin.join("tirith");
+        write_owned_test_executable(&direct);
+        std::fs::write(root.join(".crates.toml"), b"[v1]").unwrap();
+        assert!(!hermes_install_path_is_proven(
+            &direct.canonicalize().unwrap(),
+            Some(root.as_path())
+        ));
+        std::fs::remove_file(root.join(".crates.toml")).unwrap();
+
+        let profile_root = root.join("profiles").join("default");
+        let profile_bin = profile_root.join("bin");
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        let profile = profile_bin.join("tirith");
+        write_owned_test_executable(&profile);
+        std::fs::write(profile_root.join(".crates2.json"), b"{}").unwrap();
+        assert!(!hermes_install_path_is_proven(
+            &profile.canonicalize().unwrap(),
+            Some(root.as_path())
+        ));
+    }
+
+    #[test]
+    fn hermes_updates_never_request_privileged_helper_effects() {
+        use tirith_core::effects::CommandEffectKind;
+
+        let update = update_effects(&InstallMethod::SelfManaged, true, false);
+        assert!(update.contains(&CommandEffectKind::NetworkEgress));
+        assert!(update.contains(&CommandEffectKind::FilesystemWrite));
+        assert!(!update.contains(&CommandEffectKind::ResourceEscalation));
+        let rollback = rollback_effects(&InstallMethod::SelfManaged, true);
+        assert!(rollback.contains(&CommandEffectKind::FilesystemWrite));
+        assert!(!rollback.contains(&CommandEffectKind::ResourceEscalation));
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let standalone_update = update_effects(&InstallMethod::SelfManaged, false, false);
+            let standalone_rollback = rollback_effects(&InstallMethod::SelfManaged, false);
+            assert!(standalone_update.contains(&CommandEffectKind::ResourceEscalation));
+            assert!(standalone_rollback.contains(&CommandEffectKind::ResourceEscalation));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lost_hermes_reproof_aborts_without_changing_the_stable_origin() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tirith_core::effects::CommandEffectKind;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("hermes");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let binary = bin.join("tirith");
+        write_owned_test_executable(&binary);
+        let binary = binary.canonicalize().unwrap();
+        let provenance = CliProvenance {
+            core: Provenance {
+                version: "0.4.1".to_string(),
+                binary_path: Some(binary),
+                binary_sha256: None,
+                install_method: InstallMethod::SelfManaged,
+                target: None,
+                dev_build: false,
+                path_resolution_failed: false,
+            },
+            origin: CliInstallOrigin::Hermes { root: root.clone() },
+        };
+        assert!(provenance.hermes_install_still_proven());
+
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(ensure_hermes_install_still_proven(&provenance).is_err());
+        assert!(provenance.is_hermes_managed());
+        let effects = update_effects(
+            &provenance.install_method,
+            provenance.is_hermes_managed(),
+            false,
+        );
+        assert!(!effects.contains(&CommandEffectKind::ResourceEscalation));
+    }
+
     fn atomic_self_replace_for_test(dest: &Path, new_binary: &Path) -> Result<SwapResult, String> {
         let live_sha = hash_file_opt(dest).expect("test live binary");
         let backup_sha = hash_file_opt(&previous_backup_path(dest));
@@ -3309,7 +3818,7 @@ mod tests {
             dev_build: false,
             path_resolution_failed: false,
         };
-        let outcome = run_verify_self(&prov);
+        let outcome = run_verify_self(&prov, false);
         assert!(
             matches!(outcome.status, VerificationStatus::Unverified { .. }),
             "cargo install must be Unverified, got {:?}",
@@ -3583,7 +4092,7 @@ mod tests {
             dev_build: true,
             path_resolution_failed: false,
         };
-        let outcome = run_verify_self(&prov);
+        let outcome = run_verify_self(&prov, false);
         assert!(matches!(
             outcome.status,
             VerificationStatus::Unverified { .. }
@@ -3607,7 +4116,7 @@ mod tests {
             dev_build: false,
             path_resolution_failed: false,
         };
-        let outcome = run_verify_self(&prov);
+        let outcome = run_verify_self(&prov, false);
         assert!(matches!(
             outcome.status,
             VerificationStatus::Unverified { .. }
@@ -3631,7 +4140,7 @@ mod tests {
             dev_build: false,
             path_resolution_failed: false,
         };
-        let outcome = run_verify_self(&prov);
+        let outcome = run_verify_self(&prov, false);
         assert!(
             outcome.operational_error,
             "an unreadable own-binary is an operational error, not a benign unverified"
@@ -3655,7 +4164,7 @@ mod tests {
             dev_build: false,
             path_resolution_failed: false,
         };
-        let outcome = run_verify_self(&prov);
+        let outcome = run_verify_self(&prov, false);
         assert!(
             outcome.operational_error,
             "an unknown own-binary path is an operational error"
