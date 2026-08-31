@@ -139,6 +139,29 @@ class ThreatDbSourcePinsTests(unittest.TestCase):
             )
             self.assertFalse(changed_again)
 
+    def test_ossf_assign_ids_discovery_paginates_past_transient_commits(self) -> None:
+        transient_page = [
+            commit(
+                f"{index + 1:040x}",
+                "2026-09-01T01:10:00Z",
+                "Ingest OSV - Cloud Storage",
+            )
+            for index in range(PINS.COMMITS_PER_PAGE)
+        ]
+        self.fixture["commits"]["ossf/malicious-packages"] = {
+            "1": transient_page,
+            "2": [commit(self.new_ossf, "2026-09-01T01:08:00Z", "Assign IDs")],
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = self.fixture_client(Path(temporary))
+            candidate = PINS.discover_candidate(
+                self.manifest["sources"]["ossf_malicious_packages"], client
+            )
+
+        self.assertEqual(candidate["commit"], self.new_ossf)
+        self.assertEqual(candidate["subject"], "Assign IDs")
+
     def test_manifest_rejects_unreviewed_repository_and_bad_metadata(self) -> None:
         wrong_repository = copy.deepcopy(self.manifest)
         wrong_repository["sources"]["ossf_malicious_packages"]["repository"] = (

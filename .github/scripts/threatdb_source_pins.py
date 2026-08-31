@@ -31,6 +31,8 @@ EXPECTED_REPOSITORIES = {
 ALLOWED_POLICIES = {"default_branch_head", "latest_assign_ids"}
 HEX_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+COMMITS_PER_PAGE = 100
+MAX_COMMIT_PAGES = 10
 
 
 class PinError(RuntimeError):
@@ -38,7 +40,7 @@ class PinError(RuntimeError):
 
 
 class JsonClient(Protocol):
-    def commits(self, repository: str) -> Any: ...
+    def commits(self, repository: str, page: int = 1) -> Any: ...
 
     def compare(self, repository: str, base: str, head: str) -> Any: ...
 
@@ -166,8 +168,10 @@ class GitHubClient:
                 f"GitHub API request failed for {endpoint}: {error}"
             ) from error
 
-    def commits(self, repository: str) -> Any:
-        return self._get(f"/repos/{repository}/commits?per_page=100")
+    def commits(self, repository: str, page: int = 1) -> Any:
+        return self._get(
+            f"/repos/{repository}/commits?per_page={COMMITS_PER_PAGE}&page={page}"
+        )
 
     def compare(self, repository: str, base: str, head: str) -> Any:
         return self._get(f"/repos/{repository}/compare/{base}...{head}")
@@ -180,11 +184,14 @@ class FixtureClient:
         except (OSError, json.JSONDecodeError) as error:
             raise PinError(f"cannot read API fixture {path}: {error}") from error
 
-    def commits(self, repository: str) -> Any:
+    def commits(self, repository: str, page: int = 1) -> Any:
         try:
-            return self.document["commits"][repository]
+            fixture = self.document["commits"][repository]
         except (KeyError, TypeError) as error:
             raise PinError(f"API fixture has no commits for {repository}") from error
+        if isinstance(fixture, dict):
+            return fixture.get(str(page), [])
+        return fixture if page == 1 else []
 
     def compare(self, repository: str, base: str, head: str) -> Any:
         key = f"{repository}:{base}...{head}"
@@ -216,15 +223,24 @@ def normalized_commit(entry: Any, repository: str) -> dict[str, str]:
 
 def discover_candidate(source: dict[str, Any], client: JsonClient) -> dict[str, str]:
     repository = source["repository"]
-    entries = client.commits(repository)
-    if not isinstance(entries, list) or not entries:
-        raise PinError(f"{repository} returned no default-branch commits")
-    candidates = [normalized_commit(entry, repository) for entry in entries]
     if source["candidate_policy"] == "default_branch_head":
-        return candidates[0]
-    for candidate in candidates:
-        if candidate["subject"] == "Assign IDs":
-            return candidate
+        entries = client.commits(repository, 1)
+        if not isinstance(entries, list) or not entries:
+            raise PinError(f"{repository} returned no default-branch commits")
+        return normalized_commit(entries[0], repository)
+
+    for page in range(1, MAX_COMMIT_PAGES + 1):
+        entries = client.commits(repository, page)
+        if not isinstance(entries, list):
+            raise PinError(f"{repository} returned malformed commit page {page}")
+        if not entries:
+            break
+        for entry in entries:
+            candidate = normalized_commit(entry, repository)
+            if candidate["subject"] == "Assign IDs":
+                return candidate
+        if len(entries) < COMMITS_PER_PAGE:
+            break
     raise PinError(f"{repository} returned no completed Assign IDs boundary")
 
 
