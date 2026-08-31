@@ -293,9 +293,12 @@ _tirith_receipt_parent_context_is_valid() {
 }
 
 _tirith_receipt_capture_file=""
+_tirith_receipt_error_file=""
+_TIRITH_RECEIPT_REGISTER_ERROR=""
 if [[ $- == *i* ]]; then
   _tirith_receipt_capture_file="$(_tirith_new_capture_file 2>/dev/null)" || _tirith_receipt_capture_file=""
-  if [[ -n "$_tirith_receipt_capture_file" ]] \
+  _tirith_receipt_error_file="$(_tirith_new_capture_file 2>/dev/null)" || _tirith_receipt_error_file=""
+  if [[ -n "$_tirith_receipt_capture_file" && -n "$_tirith_receipt_error_file" ]] \
      && builtin command "$_TIRITH_BIN" __execution-receipt capability \
           >"$_tirith_receipt_capture_file" 2>/dev/null \
      && _tirith_read_single_capture_line "$_tirith_receipt_capture_file" \
@@ -303,7 +306,7 @@ if [[ $- == *i* ]]; then
     : > "$_tirith_receipt_capture_file"
     if builtin command "$_TIRITH_BIN" __execution-receipt register \
          --family bash --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" \
-         >"$_tirith_receipt_capture_file" 2>/dev/null \
+         >"$_tirith_receipt_capture_file" 2>"$_tirith_receipt_error_file" \
        && _tirith_read_single_capture_line "$_tirith_receipt_capture_file"; then
       _TIRITH_RECEIPT_INSTANCE="$_TIRITH_CAPTURE_LINE"
     fi
@@ -311,12 +314,18 @@ if [[ $- == *i* ]]; then
       _TIRITH_RECEIPT_PROTOCOL=3
     else
       _TIRITH_RECEIPT_INSTANCE=""
+      # Keep the first line of the rejection so the one-shot degrade warning
+      # can say WHY instead of silently downgrading (issue #221).
+      IFS= read -r _TIRITH_RECEIPT_REGISTER_ERROR \
+        < "$_tirith_receipt_error_file" 2>/dev/null || :
     fi
   fi
   [[ -n "$_tirith_receipt_capture_file" ]] \
     && _tirith_remove_capture_file "$_tirith_receipt_capture_file" >/dev/null 2>&1
+  [[ -n "$_tirith_receipt_error_file" ]] \
+    && _tirith_remove_capture_file "$_tirith_receipt_error_file" >/dev/null 2>&1
 fi
-unset _tirith_receipt_capture_file _TIRITH_CAPTURE_LINE
+unset _tirith_receipt_capture_file _tirith_receipt_error_file _TIRITH_CAPTURE_LINE
 
 # M8 ch2 — surface "this shell is on the remote side of an SSH session" to
 # `tirith prompt-status` (planned for M8 ch6) and any other downstream
@@ -1582,6 +1591,8 @@ _tirith_preexec() {
         if [[ -z "${_TIRITH_RECEIPT_DEGRADE_WARNED:-}" ]]; then
           _TIRITH_RECEIPT_DEGRADE_WARNED=1
           _tirith_output "tirith: execution receipts unavailable; legacy checks remain active but session execution evidence is degraded"
+          [[ -n "${_TIRITH_RECEIPT_REGISTER_ERROR:-}" ]] \
+            && _tirith_output "$_TIRITH_RECEIPT_REGISTER_ERROR"
         fi
       fi
     else
@@ -1944,6 +1955,8 @@ if [[ $- == *i* ]] && [[ $_TIRITH_RECEIPT_PROTOCOL -ne 3 ]]; then
   if [[ -z "${_TIRITH_RECEIPT_DEGRADE_WARNED:-}" ]]; then
     _TIRITH_RECEIPT_DEGRADE_WARNED=1
     _tirith_output "tirith: execution receipts unavailable; legacy checks remain active but session execution evidence is degraded"
+    [[ -n "${_TIRITH_RECEIPT_REGISTER_ERROR:-}" ]] \
+      && _tirith_output "$_TIRITH_RECEIPT_REGISTER_ERROR"
   fi
 fi
 

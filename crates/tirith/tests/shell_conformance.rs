@@ -1236,6 +1236,53 @@ fn zsh_session(env: &mut IsolatedEnv) -> Option<PtySession> {
     Some(sess)
 }
 
+/// Issue #221: protocol-v3 registration must succeed when the hook is sourced
+/// from an rc file whose earlier content suppressed zsh's command-substitution
+/// exec optimization (a prompt framework's WINCH trap is the common trigger).
+/// With a `$(...)` registration the register call then runs behind an
+/// intermediate forked subshell, the parent-pid binding is rejected, and the
+/// shell silently degrades to legacy mode. The capture-file registration runs
+/// tirith as a direct child of the main shell in both conditions. The WINCH
+/// trap below is load-bearing: without it, a bare rc is exec-optimized and the
+/// old registration path passes too.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn zsh_rc_file_registration_survives_suppressed_exec_optimization() {
+    let mut env = IsolatedEnv::new();
+    let zsh = match zsh_bin() {
+        Some(zsh) => zsh,
+        None => {
+            eprintln!("skipping: zsh not installed");
+            return;
+        }
+    };
+    let hook = embedded_hook("zsh-hook.zsh");
+    let zdotdir = env.workdir.join("zdot");
+    std::fs::create_dir_all(&zdotdir).expect("create ZDOTDIR");
+    std::fs::write(
+        zdotdir.join(".zshrc"),
+        format!(
+            "TRAPWINCH() {{ :; }}\nPROMPT='TIRITH_PTY> '; RPROMPT=''\nsource '{}'\n",
+            hook.display()
+        ),
+    )
+    .expect("write .zshrc");
+    env.set("ZDOTDIR", &zdotdir.display().to_string());
+    // `-d` skips global rc files; ZDOTDIR/.zshrc still loads.
+    let mut sess = PtySession::spawn(&env, &zsh, &["-d", "-i"]);
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    let startup = sess.output().to_string();
+    assert!(
+        !startup.contains("legacy mode"),
+        "rc-file hook init must not degrade to legacy mode, got:\n{startup}"
+    );
+    sess.clear_buffer();
+    sess.send_line("print -r -- \"TIRITH_RC_PROTOCOL=$_TIRITH_RECEIPT_PROTOCOL\"");
+    sess.expect("TIRITH_RC_PROTOCOL=3");
+    sess.close();
+}
+
 /// ZLE must deliver allow/warn commands exactly once, block dangerous input,
 /// and record delivered lines as durable (but honestly shell-unresolved)
 /// protocol-v3 evidence.
