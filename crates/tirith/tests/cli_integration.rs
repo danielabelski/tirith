@@ -7660,6 +7660,24 @@ fn run_freshly_written_binary(command: &mut Command) -> std::process::Output {
     panic!("the staged tirith binary stayed busy for the whole retry budget: {last}");
 }
 
+#[cfg(unix)]
+fn create_owned_install_test_dir_all(root: &Path, leaf: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    assert!(leaf.starts_with(root));
+    fs::create_dir_all(leaf).unwrap();
+    let mut current = leaf;
+    loop {
+        fs::set_permissions(current, fs::Permissions::from_mode(0o755)).unwrap();
+        if current == root {
+            break;
+        }
+        current = current
+            .parent()
+            .expect("install fixture leaf stays under root");
+    }
+}
+
 /// End-to-end rollback of a SELF-MANAGED install, with no network: a tirith binary placed under a
 /// `.local/bin` path (so it self-detects as self-managed) plus a `.tirith-previous` backup is
 /// rolled back, and the live binary's bytes become the backup's bytes. This exercises the real
@@ -7733,7 +7751,7 @@ fn update_rollback_hermes_managed_restores_previous_binary() {
     let directory = tempfile::tempdir().expect("tempdir");
     let hermes_home = directory.path().join("hermes-home");
     let bin_dir = hermes_home.join("bin");
-    fs::create_dir_all(&bin_dir).unwrap();
+    create_owned_install_test_dir_all(&hermes_home, &bin_dir);
     let live = bin_dir.join("tirith");
     fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();
     fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
@@ -7787,7 +7805,7 @@ fn update_rollback_hermes_path_with_cargo_metadata_is_refused() {
     let directory = tempfile::tempdir().expect("tempdir");
     let hermes_home = directory.path().join("cargo-root");
     let bin_dir = hermes_home.join("bin");
-    fs::create_dir_all(&bin_dir).unwrap();
+    create_owned_install_test_dir_all(&hermes_home, &bin_dir);
     fs::write(hermes_home.join(".crates.toml"), b"[v1]").unwrap();
     let live = bin_dir.join("tirith");
     fs::copy(env!("CARGO_BIN_EXE_tirith"), &live).unwrap();

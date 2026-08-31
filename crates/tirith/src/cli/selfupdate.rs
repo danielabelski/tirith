@@ -3354,6 +3354,24 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn create_owned_test_dir_all(root: &Path, leaf: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        assert!(leaf.starts_with(root));
+        std::fs::create_dir_all(leaf).unwrap();
+        let mut current = leaf;
+        loop {
+            std::fs::set_permissions(current, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if current == root {
+                break;
+            }
+            current = current
+                .parent()
+                .expect("Hermes fixture leaf stays under root");
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn hermes_root_must_be_absolute_normalized_and_outside_system_roots() {
         assert_eq!(
@@ -3386,7 +3404,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("hermes");
         let bin = root.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
+        create_owned_test_dir_all(&root, &bin);
         let direct = bin.join("tirith");
         write_owned_test_executable(&direct);
         let canonical_direct = direct.canonicalize().unwrap();
@@ -3397,7 +3415,7 @@ mod tests {
         ));
 
         let profile_bin = root.join("profiles").join("default").join("bin");
-        std::fs::create_dir_all(&profile_bin).unwrap();
+        create_owned_test_dir_all(&root, &profile_bin);
         let profile = profile_bin.join("tirith");
         write_owned_test_executable(&profile);
         assert!(hermes_install_path_is_proven(
@@ -3421,7 +3439,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let writable_root = directory.path().join("writable-hermes");
         let writable_bin = writable_root.join("bin");
-        std::fs::create_dir_all(&writable_bin).unwrap();
+        create_owned_test_dir_all(&writable_root, &writable_bin);
         let writable_binary = writable_bin.join("tirith");
         write_owned_test_executable(&writable_binary);
         std::fs::set_permissions(&writable_bin, std::fs::Permissions::from_mode(0o775)).unwrap();
@@ -3432,8 +3450,8 @@ mod tests {
 
         let symlink_root = directory.path().join("symlink-hermes");
         let real_bin = directory.path().join("real-bin");
-        std::fs::create_dir_all(&symlink_root).unwrap();
-        std::fs::create_dir_all(&real_bin).unwrap();
+        create_owned_test_dir_all(&symlink_root, &symlink_root);
+        create_owned_test_dir_all(&real_bin, &real_bin);
         let real_binary = real_bin.join("tirith");
         write_owned_test_executable(&real_binary);
         symlink(&real_bin, symlink_root.join("bin")).unwrap();
@@ -3449,7 +3467,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("hermes");
         let bin = root.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
+        create_owned_test_dir_all(&root, &bin);
         let direct = bin.join("tirith");
         write_owned_test_executable(&direct);
         std::fs::write(root.join(".crates.toml"), b"[v1]").unwrap();
@@ -3461,7 +3479,7 @@ mod tests {
 
         let profile_root = root.join("profiles").join("default");
         let profile_bin = profile_root.join("bin");
-        std::fs::create_dir_all(&profile_bin).unwrap();
+        create_owned_test_dir_all(&root, &profile_bin);
         let profile = profile_bin.join("tirith");
         write_owned_test_executable(&profile);
         std::fs::write(profile_root.join(".crates2.json"), b"{}").unwrap();
@@ -3501,7 +3519,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("hermes");
         let bin = root.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
+        create_owned_test_dir_all(&root, &bin);
         let binary = bin.join("tirith");
         write_owned_test_executable(&binary);
         let binary = binary.canonicalize().unwrap();
