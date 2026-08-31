@@ -646,14 +646,30 @@ fn shell_process_identity(
 
 #[cfg(unix)]
 fn current_tirith_executable_identity() -> Result<TirithExecutableIdentity, String> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-
     let path = std::env::current_exe()
         .map_err(|error| format!("resolve current Tirith executable: {error}"))?;
+    identity_for_launch_path(&path)
+}
+
+/// On macOS `current_exe` returns the launch path unresolved, so a symlinked
+/// launch path (Homebrew's `/opt/homebrew/bin/tirith`, npm wrappers) would fail
+/// the O_NOFOLLOW open below with ELOOP. Canonicalize first; a symlink swapped
+/// in after canonicalization still fails closed on O_NOFOLLOW.
+#[cfg(unix)]
+fn identity_for_launch_path(path: &Path) -> Result<TirithExecutableIdentity, String> {
+    let path = fs::canonicalize(path)
+        .map_err(|error| format!("resolve current Tirith executable: {error}"))?;
+    executable_identity_at(&path)
+}
+
+#[cfg(unix)]
+fn executable_identity_at(path: &Path) -> Result<TirithExecutableIdentity, String> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(&path)
+        .open(path)
         .map_err(|error| format!("open current Tirith executable: {error}"))?;
     let metadata = file
         .metadata()
@@ -670,7 +686,7 @@ fn current_tirith_executable_identity() -> Result<TirithExecutableIdentity, Stri
             "current Tirith executable is writable by group/other or is not executable".to_string(),
         );
     }
-    let path_metadata = fs::symlink_metadata(&path)
+    let path_metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("inspect current Tirith executable path: {error}"))?;
     if path_metadata.file_type().is_symlink()
         || !path_metadata.is_file()
@@ -5262,5 +5278,43 @@ mod tests {
                 "unexpected error: {reconcile_error}"
             );
         });
+    }
+
+    fn fake_executable(dir: &Path) -> PathBuf {
+        let target = dir.join("tirith-real");
+        fs::write(&target, b"#!/bin/sh\n").expect("write fake executable");
+        let mut permissions = fs::metadata(&target)
+            .expect("inspect fake executable")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&target, permissions).expect("mark fake executable executable");
+        target
+    }
+
+    #[test]
+    fn identity_for_launch_path_resolves_symlinked_launch_paths() {
+        let temporary = tempfile::tempdir().expect("temp dir");
+        let target = fake_executable(temporary.path());
+        let link = temporary.path().join("tirith-link");
+        symlink(&target, &link).expect("create launch-path symlink");
+
+        let via_link = identity_for_launch_path(&link).expect("symlinked launch path must resolve");
+        let direct = identity_for_launch_path(&target).expect("direct launch path must resolve");
+        assert_eq!(via_link, direct);
+    }
+
+    #[test]
+    fn executable_identity_at_still_refuses_symlinks() {
+        let temporary = tempfile::tempdir().expect("temp dir");
+        let target = fake_executable(temporary.path());
+        let link = temporary.path().join("tirith-link");
+        symlink(&target, &link).expect("create launch-path symlink");
+
+        let error = executable_identity_at(&link)
+            .expect_err("O_NOFOLLOW open must reject an unresolved symlink");
+        assert!(
+            error.contains("open current Tirith executable"),
+            "unexpected error: {error}"
+        );
     }
 }
