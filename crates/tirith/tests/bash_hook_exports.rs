@@ -486,6 +486,19 @@ fn doctor_distinguishes_requested_from_effective_on_degrade() {
 }
 
 #[test]
+fn doctor_explains_blocking_when_preexec_has_no_enforcement() {
+    let stdout = doctor_stdout(&[
+        ("TIRITH_BASH_MODE", "preexec"),
+        ("TIRITH_BASH_EFFECTIVE_MODE", "preexec"),
+        ("TIRITH_BASH_EFFECTIVE_PROTECTION", "warn-only"),
+    ]);
+    assert!(
+        stdout.contains("to block on bash:     export TIRITH_BASH_PREEXEC_ENFORCE=1"),
+        "an explicit warn-only preexec session must retain its blocking remedy, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn doctor_reports_not_loaded_when_exports_absent() {
     // User set a bash knob but the hook exported no effective state (e.g. the
     // shell was non-interactive, so the hook no-op'd).
