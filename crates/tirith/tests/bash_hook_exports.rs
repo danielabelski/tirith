@@ -414,6 +414,68 @@ fn degrade_to_preexec_exports_status_degraded() {
     );
 }
 
+#[test]
+fn failed_enter_accept_arm_rolls_back_pending_delivery() {
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let token = "a".repeat(64);
+    let script = format!(
+        r#"source '{}'
+_TIRITH_RECEIPT_PROTOCOL=3
+_tirith_enter_arm_accept() {{ return 1; }}
+_tirith_receipt_discard() {{
+  [[ "$1:$2" == "bash-enter:{}" ]] || return 9
+  TIRITH_TEST_DISCARDED=yes
+}}
+_tirith_degrade_to_preexec() {{
+  TIRITH_TEST_DEGRADED="$1"
+  return 0
+}}
+READLINE_LINE=""
+READLINE_POINT=0
+if _tirith_queue_enter_delivery 'printf approved' '{}'; then
+  exit 70
+fi
+printf 'LINE=[%s]\nPOINT=[%s]\nEVAL=[%s]\nCOMMAND=[%s]\nRECEIPT=[%s]\nDISCARDED=[%s]\nDEGRADED=[%s]\n' \
+  "$READLINE_LINE" "$READLINE_POINT" \
+  "${{_TIRITH_PENDING_EVAL+x}}" "${{_TIRITH_PENDING_COMMAND+x}}" \
+  "${{_TIRITH_PENDING_RECEIPT+x}}" "${{TIRITH_TEST_DISCARDED:-}}" \
+  "${{TIRITH_TEST_DEGRADED:-}}"
+"#,
+        hook_path(),
+        token,
+        token
+    );
+    let out = Command::new(bash_under_test())
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .output()
+        .expect("exercise failed guarded-accept arming");
+    assert!(
+        out.status.success(),
+        "arm-failure rollback failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for expected in [
+        "LINE=[printf approved]",
+        "POINT=[15]",
+        "EVAL=[]",
+        "COMMAND=[]",
+        "RECEIPT=[]",
+        "DISCARDED=[yes]",
+        "DEGRADED=[could not arm guarded accept-line]",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} from arm-failure rollback output:\n{stdout}"
+        );
+    }
+}
+
 // Doctor is driven off env vars; seed them directly and assert the output
 // splits "requested" (user knobs) from "effective" (live hook-exported state).
 

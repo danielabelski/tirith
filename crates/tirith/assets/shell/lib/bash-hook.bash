@@ -2115,6 +2115,32 @@ _tirith_unsafe_to_eval() {
 }
 
 
+_tirith_queue_enter_delivery() {
+  local cmd="$1" receipt_token="$2"
+  _TIRITH_PENDING_EVAL="$cmd"
+  _TIRITH_PENDING_COMMAND="$cmd"
+  # Commit marker: publish only after both command copies are complete.
+  if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
+    _TIRITH_PENDING_RECEIPT="$receipt_token"
+  fi
+
+  # The accept sub-sequence is processed only after this bind-x callback
+  # returns. If any keymap cannot be armed, roll the delivery back while the
+  # command can still be put visibly into Readline for a safe retry.
+  if ! _tirith_enter_arm_accept; then
+    unset _TIRITH_PENDING_EVAL _TIRITH_PENDING_COMMAND _TIRITH_PENDING_RECEIPT
+    _tirith_receipt_discard bash-enter "$receipt_token" || true
+    READLINE_LINE="$cmd"
+    READLINE_POINT=${#cmd}
+    _tirith_degrade_to_preexec "could not arm guarded accept-line" || true
+    return 1
+  fi
+
+  history -s -- "$cmd"
+  return 0
+}
+
+
 _tirith_startup_health_check() {
   # Test-only override: bypass startup gate to reach runtime failure paths in PTY tests.
   [[ "${_TIRITH_TEST_SKIP_HEALTH:-}" == "1" ]] && return 0
@@ -2416,30 +2442,12 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       # one quoted argument to the builtin preserves multiline/heredoc/compound
       # syntax without a source file, process-substitution race, or disk copy.
       if _tirith_unsafe_to_eval "$cmd"; then
-        history -s -- "$cmd"
-        _TIRITH_PENDING_EVAL="$cmd"
-        _TIRITH_PENDING_COMMAND="$cmd"
-        # Commit marker: publish only after both command copies are complete.
-        if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
-          _TIRITH_PENDING_RECEIPT="$receipt_token"
-        fi
-        # Arm the guarded accept-line so the now-emptied buffer is accepted and
-        # the prompt hook delivers the stashed command.
-        _tirith_enter_arm_accept
-        return 0
+        _tirith_queue_enter_delivery "$cmd" "$receipt_token"
+        return $?
       fi
 
-      history -s -- "$cmd"
-      _TIRITH_PENDING_EVAL="$cmd"
-      _TIRITH_PENDING_COMMAND="$cmd"
-      # Commit marker: publish only after both command copies are complete.
-      if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
-        _TIRITH_PENDING_RECEIPT="$receipt_token"
-      fi
-      # Arm the guarded accept-line so the now-emptied buffer is accepted and
-      # the prompt hook delivers the stashed command.
-      _tirith_enter_arm_accept
-      return 0
+      _tirith_queue_enter_delivery "$cmd" "$receipt_token"
+      return $?
     }
 
     # Bracketed paste interception
