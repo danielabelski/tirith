@@ -463,6 +463,10 @@ fn doctor_shows_effective_state_when_hook_loaded() {
         stdout.contains("effective protection: blocks"),
         "effective protection missing, got:\n{stdout}"
     );
+    assert!(
+        !stdout.contains("to restore blocking:"),
+        "a live blocking hook must not print degradation recovery guidance, got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -482,6 +486,10 @@ fn doctor_distinguishes_requested_from_effective_on_degrade() {
     assert!(
         stdout.contains("effective protection: warn-only"),
         "effective protection should report the live degraded value, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("to restore blocking:"),
+        "a requested-but-degraded blocking hook must explain how to recover, got:\n{stdout}"
     );
 }
 

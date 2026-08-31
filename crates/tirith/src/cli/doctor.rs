@@ -2666,12 +2666,23 @@ fn print_human(info: &DoctorInfo) {
                 .as_deref()
                 .map(env_is_truthy)
                 .unwrap_or(false);
+            let live_enforcement_degraded = enforce_armed
+                && matches!(
+                    info.bash_effective_protection.as_deref(),
+                    Some(protection) if !protection.eq_ignore_ascii_case("blocks")
+                );
             if forced_enter || !enforce_armed {
                 println!("  to block on bash:     export TIRITH_BASH_PREEXEC_ENFORCE=1 before the");
                 println!(
                     "                        'eval \"$(tirith init --shell bash)\"' line, then"
                 );
                 println!("                        start a new shell.");
+            } else if live_enforcement_degraded {
+                println!("  to restore blocking:  TIRITH_BASH_PREEXEC_ENFORCE is set, but this");
+                println!(
+                    "                        shell is not blocking. Resolve any hook warning,"
+                );
+                println!("                        then start a new shell.");
             }
             if forced_enter {
                 println!("                        Also remove 'export TIRITH_BASH_MODE=enter': it");
