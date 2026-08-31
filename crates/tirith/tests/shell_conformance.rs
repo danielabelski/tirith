@@ -969,6 +969,98 @@ fn bash_enter_mode_delivers_and_blocks() {
     );
 }
 
+/// Switching Readline from emacs to vi after hook installation must not expose
+/// an unguarded Enter key in either vi insertion or command mode.
+#[test]
+fn bash_enter_mode_protects_vi_keymaps_after_runtime_switch() {
+    let mut env = IsolatedEnv::new();
+    let bash = match modern_bash() {
+        Some(bash) => bash,
+        None => {
+            eprintln!("skipping: no modern bash (>= 5) found");
+            return;
+        }
+    };
+    env.set("TIRITH_BASH_MODE", "enter");
+    let allowed = env.workdir.join("vi_insert_allowed.txt");
+    let blocked = env.workdir.join("vi_command_blocked.txt");
+
+    let mut sess = PtySession::spawn(&env, &bash, &["--norc", "--noprofile", "-i"]);
+    sess.send_line("export PS1='TIRITH_PTY> '");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    let hook = embedded_hook("bash-hook.bash");
+    sess.send_line(&format!("source '{}'", hook.display()));
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+
+    sess.send_line("set -o vi");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    sess.send_line(&format!("printf 'RAN\\n' >> '{}'", allowed.display()));
+    let allowed_body = wait_for_marker(&allowed, "RAN", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&allowed_body, "RAN"),
+        1,
+        "vi-insert Enter must deliver an allowed command exactly once"
+    );
+
+    // Type in vi insertion mode, then press Escape followed by Enter so the
+    // accept action is dispatched from the separate vi-command keymap.
+    let dangerous = format!("printf 'true' | bash && touch '{}'", blocked.display());
+    sess.send_raw(dangerous.as_bytes());
+    sess.send_raw(b"\x1b\r");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.close();
+    assert!(
+        !blocked.exists(),
+        "vi-command Enter must still pass through Tirith's guarded dispatcher"
+    );
+}
+
+/// Enter-mode degradation is a session-local transition. It must restore the
+/// exact Ctrl-O bindings the user had in each protected keymap, rather than a
+/// hard-coded default.
+#[test]
+fn bash_enter_degradation_restores_custom_ctrl_o_bindings() {
+    let mut env = IsolatedEnv::new();
+    let bash = match modern_bash() {
+        Some(bash) => bash,
+        None => {
+            eprintln!("skipping: no modern bash (>= 5) found");
+            return;
+        }
+    };
+    env.set("TIRITH_BASH_MODE", "enter");
+
+    let mut sess = PtySession::spawn(&env, &bash, &["--norc", "--noprofile", "-i"]);
+    sess.send_line("export PS1='TIRITH_PTY> '");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    sess.send_line(
+        r#"bind -m emacs-standard '"\C-o": "EMACS-C-O"'; bind -m vi-insert '"\C-o": "VI-INSERT-C-O"'; bind -m vi-command '"\C-o": "VI-COMMAND-C-O"'"#,
+    );
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    let hook = embedded_hook("bash-hook.bash");
+    sess.send_line(&format!("source '{}'", hook.display()));
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    sess.send_line("_tirith_degrade_to_preexec ctrl-o-test");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    sess.send_line("bind -m emacs-standard -s; bind -m vi-insert -s; bind -m vi-command -s");
+    let output = sess.expect("VI-COMMAND-C-O");
+    sess.close();
+
+    for expected in ["EMACS-C-O", "VI-INSERT-C-O", "VI-COMMAND-C-O"] {
+        assert!(
+            output.contains(expected),
+            "degradation did not restore {expected}; got:\n{output}"
+        );
+    }
+}
+
 // === fish ===
 // The fish hook binds Enter to `_tirith_check_command`, ending with
 // `commandline -f execute` (fish's supported line-accept). Delivery is reliable;

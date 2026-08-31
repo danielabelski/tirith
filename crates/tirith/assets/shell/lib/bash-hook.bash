@@ -79,7 +79,8 @@ for _tirith_inherited_state in \
   _tirith_last_key _tirith_last_rc _tirith_last_cmd \
   _TIRITH_PREV_DEBUG_TRAP \
   _TIRITH_DEGRADE_WARNED _TIRITH_OFF_WARNED _TIRITH_PREEXEC_WARNED _TIRITH_RECEIPT_DEGRADE_WARNED \
-  _TIRITH_BINDS_INSTALLED _TIRITH_PREEXEC_PROMPT_STATUS
+  _TIRITH_BINDS_INSTALLED _TIRITH_PREEXEC_PROMPT_STATUS \
+  _TIRITH_PROTECTED_KEYMAPS _TIRITH_SAVED_CTRL_O_KINDS _TIRITH_SAVED_CTRL_O_BINDINGS
 do
   unset "$_tirith_inherited_state"
 done
@@ -1613,6 +1614,83 @@ _tirith_preexec() {
 }
 
 
+# Enter mode has to cover every primary Readline keymap a session can switch
+# to after the hook is loaded. Preserve Ctrl-O separately for each map because
+# it is an accept-line equivalent that must be disabled only while enter mode
+# owns command delivery.
+_TIRITH_PROTECTED_KEYMAPS=(emacs-standard vi-insert vi-command)
+_TIRITH_SAVED_CTRL_O_KINDS=()
+_TIRITH_SAVED_CTRL_O_BINDINGS=()
+
+_tirith_capture_ctrl_o_bindings() {
+  local map output line index
+  # Bash versions that cannot enumerate bind-x entries cannot safely preserve
+  # an existing shell-command binding. They already fail the enter-mode health
+  # gate, so refuse before changing any bindings and use preexec instead.
+  builtin bind -X >/dev/null 2>&1 || return 1
+  _TIRITH_SAVED_CTRL_O_KINDS=()
+  _TIRITH_SAVED_CTRL_O_BINDINGS=()
+
+  for ((index = 0; index < ${#_TIRITH_PROTECTED_KEYMAPS[@]}; index++)); do
+    map="${_TIRITH_PROTECTED_KEYMAPS[index]}"
+    _TIRITH_SAVED_CTRL_O_KINDS[index]="unbound"
+    _TIRITH_SAVED_CTRL_O_BINDINGS[index]=""
+
+    output="$(builtin bind -m "$map" -X 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+      if [[ "${line%% *}" == '"\C-o"' ]]; then
+        _TIRITH_SAVED_CTRL_O_KINDS[index]="bind-x"
+        _TIRITH_SAVED_CTRL_O_BINDINGS[index]="$line"
+        break
+      fi
+    done <<< "$output"
+    [[ "${_TIRITH_SAVED_CTRL_O_KINDS[index]}" == "bind-x" ]] && continue
+
+    output="$(builtin bind -m "$map" -s 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+      if [[ "${line%%:*}" == '"\C-o"' ]]; then
+        _TIRITH_SAVED_CTRL_O_KINDS[index]="binding"
+        _TIRITH_SAVED_CTRL_O_BINDINGS[index]="$line"
+        break
+      fi
+    done <<< "$output"
+    [[ "${_TIRITH_SAVED_CTRL_O_KINDS[index]}" == "binding" ]] && continue
+
+    output="$(builtin bind -m "$map" -p 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+      if [[ "${line%%:*}" == '"\C-o"' ]]; then
+        _TIRITH_SAVED_CTRL_O_KINDS[index]="binding"
+        _TIRITH_SAVED_CTRL_O_BINDINGS[index]="$line"
+        break
+      fi
+    done <<< "$output"
+  done
+  return 0
+}
+
+_tirith_restore_ctrl_o_bindings() {
+  local map kind binding index restore_rc=0
+  for ((index = 0; index < ${#_TIRITH_PROTECTED_KEYMAPS[@]}; index++)); do
+    map="${_TIRITH_PROTECTED_KEYMAPS[index]}"
+    kind="${_TIRITH_SAVED_CTRL_O_KINDS[index]:-unbound}"
+    binding="${_TIRITH_SAVED_CTRL_O_BINDINGS[index]:-}"
+    case "$kind" in
+      bind-x)
+        builtin bind -m "$map" -x "$binding" 2>/dev/null || restore_rc=1
+        ;;
+      binding)
+        builtin bind -m "$map" "$binding" 2>/dev/null || restore_rc=1
+        ;;
+      *)
+        builtin bind -m "$map" -r '"\C-o"' 2>/dev/null || true
+        ;;
+    esac
+  done
+  unset _TIRITH_SAVED_CTRL_O_KINDS _TIRITH_SAVED_CTRL_O_BINDINGS
+  return "$restore_rc"
+}
+
+
 _tirith_degrade_to_preexec() {
   local reason="${1:-unknown}"
 
@@ -1620,16 +1698,19 @@ _tirith_degrade_to_preexec() {
   # Custom bindings from .inputrc/.bashrc return on next shell (safe mode persisted,
   # so tirith won't install bind-x on restart).
   if [[ "${_TIRITH_BINDS_INSTALLED:-0}" == "1" ]]; then
-    bind '"\C-m": accept-line' 2>/dev/null || true
-    bind '"\C-j": accept-line' 2>/dev/null || true
-    # Unbind the macro-dispatch helper sequences (checker + guarded accept) so
-    # no stale binding survives the degrade.
-    bind -r '"\C-x\C-t7"' 2>/dev/null || true
-    bind -r '"\C-x\C-r7"' 2>/dev/null || true
-    # Restore operate-and-get-next, unbound in enter mode.
-    bind '"\C-o": operate-and-get-next' 2>/dev/null || true
-    # Restore bracketed paste to readline default if available, otherwise unbind
-    bind '"\e[200~": bracketed-paste-begin' 2>/dev/null || bind -r '"\e[200~"' 2>/dev/null || true
+    local _tirith_keymap
+    for _tirith_keymap in "${_TIRITH_PROTECTED_KEYMAPS[@]}"; do
+      builtin bind -m "$_tirith_keymap" '"\C-m": accept-line' 2>/dev/null || true
+      builtin bind -m "$_tirith_keymap" '"\C-j": accept-line' 2>/dev/null || true
+      # Unbind the macro-dispatch helper sequences (checker + guarded accept)
+      # so no stale binding survives the degrade in any switchable keymap.
+      builtin bind -m "$_tirith_keymap" -r '"\C-x\C-t7"' 2>/dev/null || true
+      builtin bind -m "$_tirith_keymap" -r '"\C-x\C-r7"' 2>/dev/null || true
+      # Restore bracketed paste to the Readline default if available.
+      builtin bind -m "$_tirith_keymap" '"\e[200~": bracketed-paste-begin' \
+        2>/dev/null || builtin bind -m "$_tirith_keymap" -r '"\e[200~"' 2>/dev/null || true
+    done
+    _tirith_restore_ctrl_o_bindings || true
     _TIRITH_BINDS_INSTALLED=0
   fi
 
@@ -2032,19 +2113,22 @@ _tirith_startup_health_check() {
   # Test-only override for CI (avoids needing PTY)
   [[ "${_TIRITH_TEST_FAIL_HEALTH:-}" == "1" ]] && return 1
   # The checker must be installed as a bind -x function.
-  local xbinds
-  xbinds="$(bind -X 2>/dev/null)" || return 1
-  [[ "$xbinds" == *_tirith_enter* ]] || return 1
-  # Both \C-m and \C-j must map to the checker+accept Enter macro. Build the
-  # exact `bind -s` line as a literal and match it quoted so the backslashes in
-  # the key sequences are compared literally, not treated as glob escapes.
-  local sbinds
-  sbinds="$(bind -s 2>/dev/null)" || return 1
+  local map xbinds sbinds
+  # Both \C-m and \C-j must map to the checker+accept Enter macro in every
+  # primary keymap. A later `set -o vi` must not expose an unguarded accept-line.
   local macro="$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS"
   local cm_needle="\"\\C-m\": \"$macro\""
   local cj_needle="\"\\C-j\": \"$macro\""
-  [[ "$sbinds" == *"$cm_needle"* ]] || return 1
-  [[ "$sbinds" == *"$cj_needle"* ]] || return 1
+  local check_needle="\"$_TIRITH_ENTER_CHECK_KEYS\" \"_tirith_enter\""
+  local accept_needle="\"$_TIRITH_ENTER_ACCEPT_KEYS\" \"_tirith_enter_accept_noop\""
+  for map in "${_TIRITH_PROTECTED_KEYMAPS[@]}"; do
+    xbinds="$(builtin bind -m "$map" -X 2>/dev/null)" || return 1
+    [[ "$xbinds" == *"$check_needle"* ]] || return 1
+    [[ "$xbinds" == *"$accept_needle"* ]] || return 1
+    sbinds="$(builtin bind -m "$map" -s 2>/dev/null)" || return 1
+    [[ "$sbinds" == *"$cm_needle"* ]] || return 1
+    [[ "$sbinds" == *"$cj_needle"* ]] || return 1
+  done
   # Verify prompt hook is still attached
   _tirith_is_prompt_hook_attached || return 1
   return 0
@@ -2423,27 +2507,52 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
     _TIRITH_ENTER_ACCEPT_KEYS='\C-x\C-r7'
     _tirith_enter_accept_noop() { :; }
     _tirith_enter_arm_accept() {
-      bind "\"$_TIRITH_ENTER_ACCEPT_KEYS\": accept-line" 2>/dev/null
+      local _tirith_keymap _tirith_bind_rc=0
+      for _tirith_keymap in "${_TIRITH_PROTECTED_KEYMAPS[@]}"; do
+        builtin bind -m "$_tirith_keymap" \
+          "\"$_TIRITH_ENTER_ACCEPT_KEYS\": accept-line" 2>/dev/null \
+          || _tirith_bind_rc=1
+      done
+      return "$_tirith_bind_rc"
     }
     _tirith_enter_disarm_accept() {
-      bind -x "\"$_TIRITH_ENTER_ACCEPT_KEYS\": _tirith_enter_accept_noop" 2>/dev/null
+      local _tirith_keymap _tirith_bind_rc=0
+      for _tirith_keymap in "${_TIRITH_PROTECTED_KEYMAPS[@]}"; do
+        builtin bind -m "$_tirith_keymap" -x \
+          "\"$_TIRITH_ENTER_ACCEPT_KEYS\": _tirith_enter_accept_noop" 2>/dev/null \
+          || _tirith_bind_rc=1
+      done
+      return "$_tirith_bind_rc"
     }
 
-    # Install key bindings: checker (bind -x), disarmed accept, Enter macros.
-    bind -x "\"$_TIRITH_ENTER_CHECK_KEYS\": _tirith_enter" || true
-    _tirith_enter_disarm_accept
-    bind "\"\C-m\": \"$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS\"" || true
-    bind "\"\C-j\": \"$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS\"" || true
-    bind -x '"\e[200~": _tirith_paste' || true
-    # Close accept-line-equivalent bypasses: operate-and-get-next (\C-o) accepts
-    # the current line WITHOUT running the checker. Remove it in enter mode; the
-    # degrade path restores it.
-    bind -r '"\C-o"' 2>/dev/null || true
-    _TIRITH_BINDS_INSTALLED=1
+    if ! _tirith_capture_ctrl_o_bindings; then
+      _tirith_degrade_to_preexec "could not preserve existing Ctrl-O bindings"
+    else
+      # Install checker, guarded accept, Enter macros, paste interception, and
+      # Ctrl-O closure in every keymap a live session can switch to.
+      _tirith_bind_install_ok=1
+      for _tirith_keymap in "${_TIRITH_PROTECTED_KEYMAPS[@]}"; do
+        builtin bind -m "$_tirith_keymap" -x \
+          "\"$_TIRITH_ENTER_CHECK_KEYS\": _tirith_enter" || _tirith_bind_install_ok=0
+        builtin bind -m "$_tirith_keymap" \
+          "\"\C-m\": \"$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS\"" \
+          || _tirith_bind_install_ok=0
+        builtin bind -m "$_tirith_keymap" \
+          "\"\C-j\": \"$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS\"" \
+          || _tirith_bind_install_ok=0
+        builtin bind -m "$_tirith_keymap" -x '"\e[200~": _tirith_paste' \
+          || _tirith_bind_install_ok=0
+        # operate-and-get-next accepts the current line without the checker.
+        builtin bind -m "$_tirith_keymap" -r '"\C-o"' 2>/dev/null || true
+      done
+      _tirith_enter_disarm_accept || _tirith_bind_install_ok=0
+      _TIRITH_BINDS_INSTALLED=1
 
-    # Startup health gate: verify the checker and the Enter macro took effect.
-    if ! _tirith_startup_health_check; then
-      _tirith_degrade_to_preexec "startup health check failed (enter macro or PROMPT_COMMAND)"
+      # Startup health gate: verify every protected keymap took effect.
+      if [[ "$_tirith_bind_install_ok" != "1" ]] || ! _tirith_startup_health_check; then
+        _tirith_degrade_to_preexec "startup health check failed (enter macro or PROMPT_COMMAND)"
+      fi
+      unset _tirith_keymap _tirith_bind_install_ok
     fi
   fi
 
