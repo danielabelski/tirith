@@ -1622,6 +1622,14 @@ _TIRITH_PROTECTED_KEYMAPS=(emacs-standard vi-insert vi-command)
 _TIRITH_SAVED_CTRL_O_KINDS=()
 _TIRITH_SAVED_CTRL_O_BINDINGS=()
 
+_tirith_bind_x_record_is_ctrl_o() {
+  local key="${1%%[[:space:]]*}"
+  # Bash releases have emitted both `"\C-o" command` and
+  # `"\C-o": command` forms from `bind -X`.
+  key="${key%:}"
+  [[ "$key" == '"\C-o"' ]]
+}
+
 _tirith_capture_ctrl_o_bindings() {
   local map output line index
   # Bash versions that cannot enumerate bind-x entries cannot safely preserve
@@ -1638,7 +1646,7 @@ _tirith_capture_ctrl_o_bindings() {
 
     output="$(builtin bind -m "$map" -X 2>/dev/null)" || return 1
     while IFS= read -r line; do
-      if [[ "${line%% *}" == '"\C-o"' ]]; then
+      if _tirith_bind_x_record_is_ctrl_o "$line"; then
         _TIRITH_SAVED_CTRL_O_KINDS[index]="bind-x"
         _TIRITH_SAVED_CTRL_O_BINDINGS[index]="$line"
         break

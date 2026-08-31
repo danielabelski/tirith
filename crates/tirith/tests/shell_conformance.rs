@@ -1038,7 +1038,7 @@ fn bash_enter_degradation_restores_custom_ctrl_o_bindings() {
     sess.expect("TIRITH_PTY> ");
     sess.clear_buffer();
     sess.send_line(
-        r#"bind -m emacs-standard '"\C-o": "EMACS-C-O"'; bind -m vi-insert '"\C-o": "VI-INSERT-C-O"'; bind -m vi-command '"\C-o": "VI-COMMAND-C-O"'"#,
+        r#"bind -m emacs-standard -x '"\C-o":printf EMACS-C-O'; bind -m vi-insert '"\C-o": "VI-INSERT-C-O"'; bind -m vi-command '"\C-o": "VI-COMMAND-C-O"'"#,
     );
     sess.expect("TIRITH_PTY> ");
     sess.clear_buffer();
@@ -1046,10 +1046,16 @@ fn bash_enter_degradation_restores_custom_ctrl_o_bindings() {
     sess.send_line(&format!("source '{}'", hook.display()));
     sess.expect("TIRITH_PTY> ");
     sess.clear_buffer();
+    sess.send_line(
+        r#"if _tirith_bind_x_record_is_ctrl_o '"\C-o" "printf modern"' && _tirith_bind_x_record_is_ctrl_o '"\C-o": "printf legacy"'; then printf 'TIRITH_CTRL_O_RECORDS_%s\n' OK; else printf 'TIRITH_CTRL_O_RECORDS_%s\n' BAD; fi"#,
+    );
+    sess.expect("TIRITH_CTRL_O_RECORDS_OK");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
     sess.send_line("_tirith_degrade_to_preexec ctrl-o-test");
     sess.expect("TIRITH_PTY> ");
     sess.clear_buffer();
-    sess.send_line("bind -m emacs-standard -s; bind -m vi-insert -s; bind -m vi-command -s");
+    sess.send_line("bind -m emacs-standard -X; bind -m vi-insert -s; bind -m vi-command -s");
     let output = sess.expect("VI-COMMAND-C-O");
     sess.close();
 
