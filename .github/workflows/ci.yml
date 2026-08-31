@@ -33,6 +33,12 @@ jobs:
           .github/scripts/fetch-threatdb-sources.sh
           .github/scripts/test-fetch-threatdb-sources.sh
           .github/scripts/test-threatdb-manifest-transition.sh
+      - name: Validate ThreatDB source-pin manifest and watcher
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/threatdb_source_pins.py validate \
+            .github/threatdb-source-pins.json
+          python3 .github/scripts/test_threatdb_source_pins.py
       - name: Validate fail-closed ThreatDB fetch orchestration
         run: bash .github/scripts/test-fetch-threatdb-sources.sh
       - name: Validate ThreatDB manifest transition fixtures

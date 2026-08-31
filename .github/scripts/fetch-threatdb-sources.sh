@@ -9,15 +9,45 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
+SOURCE_PINS_FILE=${THREATDB_SOURCE_PINS_FILE:-$REPO_ROOT/.github/threatdb-source-pins.json}
+
+if ! IFS=$'\t' read -r \
+  MANIFEST_OSSF_REF MANIFEST_OSSF_COMMIT_TIMESTAMP MANIFEST_OSSF_SELECTED_AT \
+  MANIFEST_DD_REF MANIFEST_DD_COMMIT_TIMESTAMP MANIFEST_DD_SELECTED_AT \
+  MANIFEST_TYPOSQUAT_REF MANIFEST_TYPOSQUAT_COMMIT_TIMESTAMP MANIFEST_TYPOSQUAT_SELECTED_AT \
+  < <(python3 "$SCRIPT_DIR/threatdb_source_pins.py" resolve "$SOURCE_PINS_FILE")
+then
+  echo "::error::cannot resolve the canonical ThreatDB source-pin manifest" >&2
+  exit 1
+fi
 
 OUTPUT_ROOT=${THREATDB_FETCH_OUTPUT_DIR:-/tmp}
 FINAL_DIR="$OUTPUT_ROOT/tirith-threatdb-sources"
 
-# Reviewed immutable upstream revisions. The workflow mirrors these values and
-# every clone is verified against them before it becomes compiler-visible.
-OSSF_MP_REF=${THREATDB_OSSF_MP_REF:-54642f7ee96e780b046660519b028fefb635375a}
-DD_MP_REF=${THREATDB_DD_MP_REF:-2d09839012cedc387ce438debeb77884ac2a242c}
-TYPOSQUAT_REF=${THREATDB_TYPOSQUAT_REF:-fd0bde98d200efe5c282a07edc4c68fba13252c6}
+# Reviewed immutable upstream revisions have one canonical manifest. Explicit
+# overrides remain available for pre-review shadow builds, but production uses
+# the manifest and verifies every checkout before it becomes compiler-visible.
+OSSF_MP_REF=${THREATDB_OSSF_MP_REF:-$MANIFEST_OSSF_REF}
+DD_MP_REF=${THREATDB_DD_MP_REF:-$MANIFEST_DD_REF}
+TYPOSQUAT_REF=${THREATDB_TYPOSQUAT_REF:-$MANIFEST_TYPOSQUAT_REF}
+OSSF_PIN_SELECTED_AT=${THREATDB_OSSF_PIN_SELECTED_AT:-}
+DD_PIN_SELECTED_AT=${THREATDB_DD_PIN_SELECTED_AT:-}
+TYPOSQUAT_PIN_SELECTED_AT=${THREATDB_TYPOSQUAT_PIN_SELECTED_AT:-}
+if [ "$OSSF_MP_REF" = "$MANIFEST_OSSF_REF" ]; then
+  OSSF_PIN_SELECTED_AT=$MANIFEST_OSSF_SELECTED_AT
+fi
+if [ "$DD_MP_REF" = "$MANIFEST_DD_REF" ]; then
+  DD_PIN_SELECTED_AT=$MANIFEST_DD_SELECTED_AT
+fi
+if [ "$TYPOSQUAT_REF" = "$MANIFEST_TYPOSQUAT_REF" ]; then
+  TYPOSQUAT_PIN_SELECTED_AT=$MANIFEST_TYPOSQUAT_SELECTED_AT
+fi
+if [ -z "$OSSF_PIN_SELECTED_AT" ] ||
+   [ -z "$DD_PIN_SELECTED_AT" ] ||
+   [ -z "$TYPOSQUAT_PIN_SELECTED_AT" ]; then
+  echo "::error::source-ref overrides require matching THREATDB_*_PIN_SELECTED_AT provenance" >&2
+  exit 1
+fi
 COMPILER_BIN=${THREATDB_COMPILER_BIN:-./target/release/tirith-threatdb-compile}
 WEB3_ANCHOR_FILE=${THREATDB_WEB3_ANCHOR_FILE:-$REPO_ROOT/crates/tirith/assets/data/web3_package_anchors.csv}
 
@@ -145,6 +175,22 @@ run_fetch() {
   local timeout_seconds
   timeout_seconds=$(remaining_timeout_seconds) || return 1
   "$TIMEOUT_BIN" --signal=TERM --kill-after=10s "${timeout_seconds}s" "$@" &
+}
+
+git_commit_timestamp() {
+  local checkout=$1
+  local timestamp
+  timestamp=$(run_bounded git -C "$checkout" show -s --format=%cI HEAD)
+  python3 -c '
+import datetime
+import sys
+
+value = sys.argv[1]
+parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+if parsed.tzinfo is None:
+    raise SystemExit("git commit timestamp is not timezone-aware")
+print(parsed.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+' "$timestamp"
 }
 
 run_source_git_step() {
@@ -292,6 +338,25 @@ if [ "$OSSF_MP_SHA" != "$OSSF_MP_REF" ] ||
   exit 1
 fi
 
+OSSF_COMMIT_TIMESTAMP=$(git_commit_timestamp "$STAGED_SOURCES/ossf-mp")
+DD_COMMIT_TIMESTAMP=$(git_commit_timestamp "$STAGED_SOURCES/dd-mp")
+TYPOSQUAT_COMMIT_TIMESTAMP=$(git_commit_timestamp "$STAGED_SOURCES/typosquats")
+if [ "$OSSF_MP_REF" = "$MANIFEST_OSSF_REF" ] &&
+   [ "$OSSF_COMMIT_TIMESTAMP" != "$MANIFEST_OSSF_COMMIT_TIMESTAMP" ]; then
+  echo "::error::OpenSSF commit timestamp disagrees with the canonical pin manifest" >&2
+  exit 1
+fi
+if [ "$DD_MP_REF" = "$MANIFEST_DD_REF" ] &&
+   [ "$DD_COMMIT_TIMESTAMP" != "$MANIFEST_DD_COMMIT_TIMESTAMP" ]; then
+  echo "::error::DataDog commit timestamp disagrees with the canonical pin manifest" >&2
+  exit 1
+fi
+if [ "$TYPOSQUAT_REF" = "$MANIFEST_TYPOSQUAT_REF" ] &&
+   [ "$TYPOSQUAT_COMMIT_TIMESTAMP" != "$MANIFEST_TYPOSQUAT_COMMIT_TIMESTAMP" ]; then
+  echo "::error::typosquat commit timestamp disagrees with the canonical pin manifest" >&2
+  exit 1
+fi
+
 for required in \
   "$STAGED_SOURCES/ossf-mp/LICENSE" \
   "$STAGED_SOURCES/dd-mp/LICENSE" \
@@ -423,11 +488,17 @@ jq -cS -n \
   --arg retrieved_at "$RETRIEVED_AT" \
   --arg compiler_version "$COMPILER_VERSION" \
   --arg ossf_ref "$OSSF_MP_REF" --arg ossf_commit "$OSSF_MP_SHA" \
+  --arg ossf_commit_timestamp "$OSSF_COMMIT_TIMESTAMP" \
+  --arg ossf_pin_selected_at "$OSSF_PIN_SELECTED_AT" \
   --arg ossf_content_sha "$OSSF_CONTENT_SHA" \
   --argjson ossf_files "$OSSF_FILE_COUNT" --argjson ossf_bytes "$OSSF_FILE_BYTES" \
   --arg dd_ref "$DD_MP_REF" --arg dd_commit "$DD_MP_SHA" --argjson dd_bytes "$DD_FILE_BYTES" \
+  --arg dd_commit_timestamp "$DD_COMMIT_TIMESTAMP" \
+  --arg dd_pin_selected_at "$DD_PIN_SELECTED_AT" \
   --arg dd_content_sha "$DD_CONTENT_SHA" \
   --arg typo_ref "$TYPOSQUAT_REF" --arg typo_commit "$TYPOSQUAT_SHA" \
+  --arg typo_commit_timestamp "$TYPOSQUAT_COMMIT_TIMESTAMP" \
+  --arg typo_pin_selected_at "$TYPOSQUAT_PIN_SELECTED_AT" \
   --arg typo_content_sha "$TYPOSQUAT_CONTENT_SHA" \
   --argjson typo_rows "$TYPOSQUAT_COUNT" --argjson typo_bytes "$TYPOSQUAT_BYTES" \
   --arg registry_retrieved_at "$REGISTRY_SNAPSHOT_RETRIEVED_AT" \
@@ -441,22 +512,22 @@ jq -cS -n \
     schema_version: 2,
     retrieved_at: $retrieved_at,
     compiler_version: $compiler_version,
-    ossf_malicious_packages: {
+    ossf_malicious_packages: ({
       source_url: "https://github.com/ossf/malicious-packages.git",
       ref: $ossf_ref, commit: $ossf_commit, spdx: "CC-BY-4.0",
       files: $ossf_files, bytes: $ossf_bytes, content_sha256: $ossf_content_sha
-    },
-    datadog_malicious_software_packages: {
+    } + {commit_timestamp: $ossf_commit_timestamp, pin_selected_at: $ossf_pin_selected_at}),
+    datadog_malicious_software_packages: ({
       source_url: "https://github.com/DataDog/malicious-software-packages-dataset.git",
       ref: $dd_ref, commit: $dd_commit, spdx: "Apache-2.0",
       files: 2, bytes: $dd_bytes, content_sha256: $dd_content_sha
-    },
-    ecosystems_typosquatting_dataset: {
+    } + {commit_timestamp: $dd_commit_timestamp, pin_selected_at: $dd_pin_selected_at}),
+    ecosystems_typosquatting_dataset: ({
       source_url: "https://github.com/ecosyste-ms/typosquatting-dataset.git",
       ref: $typo_ref, commit: $typo_commit, spdx: "CC0-1.0",
       files: 1, rows: $typo_rows, bytes: $typo_bytes,
       content_sha256: $typo_content_sha
-    },
+    } + {commit_timestamp: $typo_commit_timestamp, pin_selected_at: $typo_pin_selected_at}),
     registry_version_snapshot: {
       ossf_commit: $ossf_commit, retrieved_at: $registry_retrieved_at,
       source_urls: ["https://registry.npmjs.org/", "https://pypi.org/pypi/"],

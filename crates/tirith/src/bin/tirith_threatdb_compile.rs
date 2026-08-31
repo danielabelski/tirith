@@ -732,6 +732,10 @@ struct GitSourceProvenance {
     source_url: String,
     r#ref: String,
     commit: String,
+    #[serde(default)]
+    commit_timestamp: Option<String>,
+    #[serde(default)]
+    pin_selected_at: Option<String>,
     spdx: String,
     files: usize,
     bytes: usize,
@@ -744,6 +748,10 @@ struct RowSourceProvenance {
     source_url: String,
     r#ref: String,
     commit: String,
+    #[serde(default)]
+    commit_timestamp: Option<String>,
+    #[serde(default)]
+    pin_selected_at: Option<String>,
     spdx: String,
     files: usize,
     rows: usize,
@@ -853,6 +861,38 @@ fn validate_utc_timestamp(value: &str, label: &str) -> FeedResult<()> {
     Ok(())
 }
 
+fn validate_pin_timestamps(
+    commit_timestamp: Option<&str>,
+    pin_selected_at: Option<&str>,
+    label: &str,
+) -> FeedResult<()> {
+    let (Some(commit_timestamp), Some(pin_selected_at)) = (commit_timestamp, pin_selected_at)
+    else {
+        if commit_timestamp.is_none() && pin_selected_at.is_none() {
+            // Historical provenance predates source-pin freshness metadata.
+            return Ok(());
+        }
+        return Err(format!(
+            "{label} commit_timestamp and pin_selected_at must appear together"
+        ));
+    };
+    validate_utc_timestamp(
+        commit_timestamp,
+        &format!("{label} source commit timestamp"),
+    )?;
+    validate_utc_timestamp(pin_selected_at, &format!("{label} pin selection time"))?;
+    let committed =
+        chrono::DateTime::parse_from_rfc3339(commit_timestamp).expect("timestamp validated above");
+    let selected =
+        chrono::DateTime::parse_from_rfc3339(pin_selected_at).expect("timestamp validated above");
+    if committed > selected {
+        return Err(format!(
+            "{label} pin was selected before its commit existed"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_git_source(
     source: &GitSourceProvenance,
     expected_url: &str,
@@ -867,6 +907,11 @@ fn validate_git_source(
     if source.r#ref != source.commit || source.files == 0 || source.bytes == 0 {
         return Err(format!("{label} revision/count metadata is inconsistent"));
     }
+    validate_pin_timestamps(
+        source.commit_timestamp.as_deref(),
+        source.pin_selected_at.as_deref(),
+        label,
+    )?;
     validate_lower_hex(
         &source.content_sha256,
         32,
@@ -990,7 +1035,12 @@ fn verify_expected_summary(
     Ok(())
 }
 
-fn verify_git_checkout(root: &Path, expected_commit: &str, label: &str) -> FeedResult<()> {
+fn verify_git_checkout(
+    root: &Path,
+    expected_commit: &str,
+    expected_timestamp: Option<&str>,
+    label: &str,
+) -> FeedResult<()> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -1007,6 +1057,32 @@ fn verify_git_checkout(root: &Path, expected_commit: &str, label: &str) -> FeedR
         return Err(format!(
             "{label} Git HEAD {head} does not match pinned {expected_commit}"
         ));
+    }
+    if let Some(expected_timestamp) = expected_timestamp {
+        validate_utc_timestamp(
+            expected_timestamp,
+            &format!("{label} source commit timestamp"),
+        )?;
+        let timestamp = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["show", "-s", "--format=%cI", "HEAD"])
+            .output()
+            .map_err(|error| format!("cannot inspect {label} Git commit time: {error}"))?;
+        if !timestamp.status.success() {
+            return Err(format!("cannot resolve {label} Git commit time"));
+        }
+        let timestamp = std::str::from_utf8(&timestamp.stdout)
+            .map_err(|_| format!("{label} Git commit time is not UTF-8"))?
+            .trim();
+        let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp)
+            .map_err(|error| format!("{label} Git commit time is not RFC3339: {error}"))?
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        if timestamp != expected_timestamp {
+            return Err(format!(
+                "{label} Git commit time {timestamp} does not match provenance {expected_timestamp}"
+            ));
+        }
     }
     let status = std::process::Command::new("git")
         .arg("-C")
@@ -1123,11 +1199,16 @@ fn verify_source_inputs(
     verify_git_checkout(
         inputs.ossf,
         &document.ossf_malicious_packages.commit,
+        document.ossf_malicious_packages.commit_timestamp.as_deref(),
         "OpenSSF",
     )?;
     verify_git_checkout(
         inputs.datadog,
         &document.datadog_malicious_software_packages.commit,
+        document
+            .datadog_malicious_software_packages
+            .commit_timestamp
+            .as_deref(),
         "Datadog",
     )?;
     verify_git_checkout(
@@ -1136,6 +1217,10 @@ fn verify_source_inputs(
             .parent()
             .ok_or_else(|| "typosquat CSV has no source root".to_string())?,
         &document.ecosystems_typosquatting_dataset.commit,
+        document
+            .ecosystems_typosquatting_dataset
+            .commit_timestamp
+            .as_deref(),
         "typosquat",
     )?;
     verify_source_contents(document, inputs)
@@ -1206,6 +1291,11 @@ impl SourceTransactionBinding {
         if typosquats.r#ref != typosquats.commit {
             return Err("typosquat ref/commit metadata disagrees".to_string());
         }
+        validate_pin_timestamps(
+            typosquats.commit_timestamp.as_deref(),
+            typosquats.pin_selected_at.as_deref(),
+            "typosquat",
+        )?;
         validate_lower_hex(&typosquats.content_sha256, 32, "typosquat content SHA-256")?;
         for (source, expected_url, expected_spdx, label) in [
             (
@@ -7118,6 +7208,8 @@ mod tests {
                 "source_url": "https://github.com/ossf/malicious-packages.git",
                 "ref": "1ea2762d5fb415aef003a244d5aa83c5fc48cc6e",
                 "commit": "1ea2762d5fb415aef003a244d5aa83c5fc48cc6e",
+                "commit_timestamp": "2026-08-08T00:00:00Z",
+                "pin_selected_at": "2026-08-08T00:00:01Z",
                 "spdx": "CC-BY-4.0", "files": 1, "bytes": 1,
                 "content_sha256": "11".repeat(32)
             },
@@ -7125,6 +7217,8 @@ mod tests {
                 "source_url": "https://github.com/DataDog/malicious-software-packages-dataset.git",
                 "ref": "ef4a781d476cd6eb89c8517ff9adbb54a5cfa8cc",
                 "commit": "ef4a781d476cd6eb89c8517ff9adbb54a5cfa8cc",
+                "commit_timestamp": "2026-08-07T00:00:00Z",
+                "pin_selected_at": "2026-08-08T00:00:01Z",
                 "spdx": "Apache-2.0", "files": 2, "bytes": 2,
                 "content_sha256": "22".repeat(32)
             },
@@ -7132,6 +7226,8 @@ mod tests {
                 "source_url": "https://github.com/ecosyste-ms/typosquatting-dataset.git",
                 "ref": "fd0bde98d200efe5c282a07edc4c68fba13252c6",
                 "commit": "fd0bde98d200efe5c282a07edc4c68fba13252c6",
+                "commit_timestamp": "2025-12-17T11:33:09Z",
+                "pin_selected_at": "2026-08-08T00:00:01Z",
                 "spdx": "CC0-1.0", "files": 1, "rows": 100, "bytes": 3,
                 "content_sha256": "33".repeat(32)
             },
@@ -7176,6 +7272,29 @@ mod tests {
                 .unwrap_err()
                 .contains("do not match source provenance")
         );
+    }
+
+    #[test]
+    fn source_pin_freshness_timestamps_are_paired_and_chronological() {
+        assert!(validate_pin_timestamps(None, None, "fixture").is_ok());
+        assert!(validate_pin_timestamps(
+            Some("2026-08-31T18:32:57Z"),
+            Some("2026-08-31T20:01:37Z"),
+            "fixture"
+        )
+        .is_ok());
+        assert!(
+            validate_pin_timestamps(Some("2026-08-31T18:32:57Z"), None, "fixture")
+                .unwrap_err()
+                .contains("must appear together")
+        );
+        assert!(validate_pin_timestamps(
+            Some("2026-09-01T00:00:01Z"),
+            Some("2026-09-01T00:00:00Z"),
+            "fixture"
+        )
+        .unwrap_err()
+        .contains("before its commit existed"));
     }
 
     #[test]
@@ -7335,10 +7454,29 @@ mod tests {
             .output()
             .unwrap();
         let commit = std::str::from_utf8(&output.stdout).unwrap().trim();
-        verify_git_checkout(directory.path(), commit, "fixture").unwrap();
-        assert!(verify_git_checkout(directory.path(), &"77".repeat(20), "fixture").is_err());
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(directory.path())
+            .args(["show", "-s", "--format=%cI", "HEAD"])
+            .output()
+            .unwrap();
+        let timestamp = chrono::DateTime::parse_from_rfc3339(
+            std::str::from_utf8(&output.stdout).unwrap().trim(),
+        )
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        verify_git_checkout(directory.path(), commit, Some(&timestamp), "fixture").unwrap();
+        assert!(verify_git_checkout(
+            directory.path(),
+            commit,
+            Some("2020-01-01T00:00:00Z"),
+            "fixture"
+        )
+        .unwrap_err()
+        .contains("does not match provenance"));
+        assert!(verify_git_checkout(directory.path(), &"77".repeat(20), None, "fixture").is_err());
         std::fs::write(directory.path().join("input.txt"), b"dirty\n").unwrap();
-        assert!(verify_git_checkout(directory.path(), commit, "fixture").is_err());
+        assert!(verify_git_checkout(directory.path(), commit, None, "fixture").is_err());
     }
 
     #[test]
