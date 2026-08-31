@@ -300,13 +300,13 @@ if [[ $- == *i* ]]; then
   _tirith_receipt_error_file="$(_tirith_new_capture_file 2>/dev/null)" || _tirith_receipt_error_file=""
   if [[ -n "$_tirith_receipt_capture_file" && -n "$_tirith_receipt_error_file" ]] \
      && builtin command "$_TIRITH_BIN" __execution-receipt capability \
-          >"$_tirith_receipt_capture_file" 2>/dev/null \
+          >|"$_tirith_receipt_capture_file" 2>/dev/null \
      && _tirith_read_single_capture_line "$_tirith_receipt_capture_file" \
      && [[ "$_TIRITH_CAPTURE_LINE" == "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3" ]]; then
-    : > "$_tirith_receipt_capture_file"
+    : >| "$_tirith_receipt_capture_file"
     if builtin command "$_TIRITH_BIN" __execution-receipt register \
          --family bash --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" \
-         >"$_tirith_receipt_capture_file" 2>"$_tirith_receipt_error_file" \
+         >|"$_tirith_receipt_capture_file" 2>|"$_tirith_receipt_error_file" \
        && _tirith_read_single_capture_line "$_tirith_receipt_capture_file"; then
       _TIRITH_RECEIPT_INSTANCE="$_TIRITH_CAPTURE_LINE"
     fi

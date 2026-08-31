@@ -218,6 +218,15 @@ function _tirith_v3_remove_capture_files
     command "$_TIRITH_RM_BIN" -f -- $argv
 end
 
+function _tirith_v3_cleanup_registration_files
+    for file in $argv
+        if test -n "$file"
+            _tirith_v3_remove_capture_files "$file" >/dev/null 2>&1
+        end
+    end
+    return 0
+end
+
 # Protocol-v3 registration. The Rust side binds the receipt capability to its
 # immediate parent pid, so tirith must run as a direct child of this shell.
 # Register with a plain redirected foreground command rather than a command
@@ -242,7 +251,9 @@ if status is-interactive
             set -g _TIRITH_RECEIPT_INSTANCE ""
             read -g _TIRITH_RECEIPT_REGISTER_ERROR <"$register_err"
         end
-        _tirith_v3_remove_capture_files "$register_out" "$register_err" >/dev/null 2>&1
+        _tirith_v3_cleanup_registration_files "$register_out" "$register_err"
+    else
+        _tirith_v3_cleanup_registration_files "$register_out" "$register_err"
     end
 end
 
