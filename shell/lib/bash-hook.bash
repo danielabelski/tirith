@@ -502,13 +502,16 @@ _tirith_persist_safe_mode() {
   fi
 }
 
-# --- Enter-mode capability cache (issue #111) -------------------------------
+# --- Enter-mode capability cache (issues #111, #224) ------------------------
 #
-# `bind -x` on Enter runs the bound function but, in many environments, does
-# NOT then accept the line — bash never returns to its command loop, the
-# pending command is never delivered, and it is silently eaten. Whether this
-# happens is a property of the running bash/readline build, not the version
-# number, so it cannot be decided by a version gate.
+# A bare `bind -x` on Enter runs the bound function but does NOT then accept the
+# line on stock bash, so the pending command was never delivered and was
+# silently eaten (#111). Enter mode now binds Enter to a MACRO that runs the
+# checker and then a guarded accept-line (see the install block below), which
+# delivers and blocks on every stock bash tested (5.2, 5.3). The self-test is
+# retained as a fail-closed gate: if the macro mechanism ever fails to deliver
+# or block on some exotic build, the probe records that and the hook falls back
+# to preexec rather than risk eating a command.
 #
 # `tirith setup` / `tirith doctor` run a PTY self-test that PROVES whether
 # enter-mode delivery works, and write the verdict to a cache file. This hook
@@ -1619,6 +1622,12 @@ _tirith_degrade_to_preexec() {
   if [[ "${_TIRITH_BINDS_INSTALLED:-0}" == "1" ]]; then
     bind '"\C-m": accept-line' 2>/dev/null || true
     bind '"\C-j": accept-line' 2>/dev/null || true
+    # Unbind the macro-dispatch helper sequences (checker + guarded accept) so
+    # no stale binding survives the degrade.
+    bind -r '"\C-x\C-t7"' 2>/dev/null || true
+    bind -r '"\C-x\C-r7"' 2>/dev/null || true
+    # Restore operate-and-get-next, unbound in enter mode.
+    bind '"\C-o": operate-and-get-next' 2>/dev/null || true
     # Restore bracketed paste to readline default if available, otherwise unbind
     bind '"\e[200~": bracketed-paste-begin' 2>/dev/null || bind -r '"\e[200~"' 2>/dev/null || true
     _TIRITH_BINDS_INSTALLED=0
@@ -1692,6 +1701,12 @@ _tirith_degrade_to_preexec() {
 
 
 _tirith_prompt_hook() {
+  # Re-disarm the guarded accept-line every prompt. Arming leaves it bound to
+  # accept-line until this runs, so disarming here closes the window in which
+  # an injected accept sequence could accept a line the checker never approved.
+  if declare -F _tirith_enter_disarm_accept >/dev/null 2>&1; then
+    _tirith_enter_disarm_accept
+  fi
   local pending_eval="${_TIRITH_PENDING_EVAL:-}"
   local pending_receipt="${_TIRITH_PENDING_RECEIPT:-}"
   local pending_command="${_TIRITH_PENDING_COMMAND:-}"
@@ -1745,8 +1760,18 @@ _tirith_is_prompt_hook_attached() {
 _tirith_ensure_prompt_hook() {
   _tirith_is_prompt_hook_attached && return 0
 
-  local pc_decl
+  local pc_decl pc_attrs
   pc_decl="$(declare -p PROMPT_COMMAND 2>/dev/null)" || pc_decl=""
+  pc_attrs="${pc_decl#declare }"
+  pc_attrs="${pc_attrs%% *}"
+  # Never attempt the assignment when PROMPT_COMMAND is readonly (or otherwise
+  # unwrappable): assigning to a readonly variable is a FATAL error that aborts
+  # this whole function before it can report failure, so the caller would never
+  # see a return value and never degrade. Refuse cleanly instead, and let the
+  # caller degrade (the preexec-guard install refuses the same attributes).
+  if [[ -n "$pc_decl" ]]; then
+    _tirith_prompt_command_attrs_safe "$pc_attrs" || return 1
+  fi
 
   if [[ "$pc_decl" == "declare -a"* ]]; then
     PROMPT_COMMAND=(_tirith_prompt_hook "${PROMPT_COMMAND[@]}") 2>/dev/null || return 1
@@ -1755,7 +1780,8 @@ _tirith_ensure_prompt_hook() {
   else
     PROMPT_COMMAND="_tirith_prompt_hook" 2>/dev/null || return 1
   fi
-  return 0
+  # Confirm the reattachment actually took effect.
+  _tirith_is_prompt_hook_attached
 }
 
 
@@ -2005,11 +2031,20 @@ _tirith_startup_health_check() {
   [[ "${_TIRITH_TEST_SKIP_HEALTH:-}" == "1" ]] && return 0
   # Test-only override for CI (avoids needing PTY)
   [[ "${_TIRITH_TEST_FAIL_HEALTH:-}" == "1" ]] && return 1
-  # Verify both \C-m and \C-j are bound to _tirith_enter
-  local binds
-  binds="$(bind -X 2>/dev/null)" || return 1
-  [[ "$binds" =~ \\C-m.*_tirith_enter ]] || return 1
-  [[ "$binds" =~ \\C-j.*_tirith_enter ]] || return 1
+  # The checker must be installed as a bind -x function.
+  local xbinds
+  xbinds="$(bind -X 2>/dev/null)" || return 1
+  [[ "$xbinds" == *_tirith_enter* ]] || return 1
+  # Both \C-m and \C-j must map to the checker+accept Enter macro. Build the
+  # exact `bind -s` line as a literal and match it quoted so the backslashes in
+  # the key sequences are compared literally, not treated as glob escapes.
+  local sbinds
+  sbinds="$(bind -s 2>/dev/null)" || return 1
+  local macro="$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS"
+  local cm_needle="\"\\C-m\": \"$macro\""
+  local cj_needle="\"\\C-j\": \"$macro\""
+  [[ "$sbinds" == *"$cm_needle"* ]] || return 1
+  [[ "$sbinds" == *"$cj_needle"* ]] || return 1
   # Verify prompt hook is still attached
   _tirith_is_prompt_hook_attached || return 1
   return 0
@@ -2054,10 +2089,11 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         return  # READLINE_LINE stays intact
       fi
 
-      # Empty input: just return (shows new prompt)
+      # Empty input: accept the empty line so a fresh prompt is shown.
       if [[ -z "$READLINE_LINE" ]]; then
         READLINE_LINE=""
         READLINE_POINT=0
+        _tirith_enter_arm_accept
         return
       fi
 
@@ -2295,6 +2331,9 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
           _TIRITH_PENDING_RECEIPT="$receipt_token"
         fi
+        # Arm the guarded accept-line so the now-emptied buffer is accepted and
+        # the prompt hook delivers the stashed command.
+        _tirith_enter_arm_accept
         return 0
       fi
 
@@ -2305,6 +2344,9 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
         _TIRITH_PENDING_RECEIPT="$receipt_token"
       fi
+      # Arm the guarded accept-line so the now-emptied buffer is accepted and
+      # the prompt hook delivers the stashed command.
+      _tirith_enter_arm_accept
       return 0
     }
 
@@ -2368,15 +2410,40 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       READLINE_POINT=$((READLINE_POINT + ${#pasted}))
     }
 
-    # Install key bindings
-    bind -x '"\C-m": _tirith_enter' || true
-    bind -x '"\C-j": _tirith_enter' || true
+    # Macro-dispatch delivery (issues #111, #224). A bare `bind -x` on Enter
+    # runs the checker but does NOT then accept the line on stock bash, so the
+    # stashed command was silently eaten and the hook degraded to preexec. Bind
+    # Enter to a MACRO that runs the checker and then a GUARDED accept-line: the
+    # accept sub-sequence is a no-op until `_tirith_enter` arms it, so a line is
+    # only accepted once the checker has decided to deliver it (the prompt hook
+    # then evaluates the stashed command, exactly as before). A raw injection of
+    # the accept bytes hits the disarmed no-op, and every prompt re-disarms it,
+    # so possession of the accept sequence alone can never accept a line.
+    _TIRITH_ENTER_CHECK_KEYS='\C-x\C-t7'
+    _TIRITH_ENTER_ACCEPT_KEYS='\C-x\C-r7'
+    _tirith_enter_accept_noop() { :; }
+    _tirith_enter_arm_accept() {
+      bind "\"$_TIRITH_ENTER_ACCEPT_KEYS\": accept-line" 2>/dev/null
+    }
+    _tirith_enter_disarm_accept() {
+      bind -x "\"$_TIRITH_ENTER_ACCEPT_KEYS\": _tirith_enter_accept_noop" 2>/dev/null
+    }
+
+    # Install key bindings: checker (bind -x), disarmed accept, Enter macros.
+    bind -x "\"$_TIRITH_ENTER_CHECK_KEYS\": _tirith_enter" || true
+    _tirith_enter_disarm_accept
+    bind "\"\C-m\": \"$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS\"" || true
+    bind "\"\C-j\": \"$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS\"" || true
     bind -x '"\e[200~": _tirith_paste' || true
+    # Close accept-line-equivalent bypasses: operate-and-get-next (\C-o) accepts
+    # the current line WITHOUT running the checker. Remove it in enter mode; the
+    # degrade path restores it.
+    bind -r '"\C-o"' 2>/dev/null || true
     _TIRITH_BINDS_INSTALLED=1
 
-    # Startup health gate: verify bind-x took effect for BOTH keys
+    # Startup health gate: verify the checker and the Enter macro took effect.
     if ! _tirith_startup_health_check; then
-      _tirith_degrade_to_preexec "startup health check failed (bind-x or PROMPT_COMMAND)"
+      _tirith_degrade_to_preexec "startup health check failed (enter macro or PROMPT_COMMAND)"
     fi
   fi
 

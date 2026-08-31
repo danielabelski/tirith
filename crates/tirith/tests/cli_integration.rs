@@ -4377,7 +4377,7 @@ send -- "PROMPT_COMMAND=':'; readonly PROMPT_COMMAND\r"
 expect "PROMPT> "
 send -- "echo PTY_RUNTIME_CHECK\r"
 expect {
-  -re {protection downgraded} {}
+  -re {protection downgraded|interception is off|enter mode failed} {}
   timeout { exit 2 }
 }
 send -- "\r"

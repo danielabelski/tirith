@@ -13,13 +13,14 @@
 //! SKIPS cleanly when its shell is missing or too old, so `cargo test` stays
 //! green (put a modern bash first on `PATH` to exercise the bash tests).
 //!
-//! Issue #111: bash ENTER mode can't deliver in a standard PTY (`bind -x` runs
-//! the function without accepting the line, so `PROMPT_COMMAND` never fires).
-//! A self-test (`cli::bash_capability`) proves the capability and the hook uses
-//! enter only where proven, else falls back to preexec. This bare PTY is a
-//! broken-delivery environment, so preexec is the capability-correct behaviour;
-//! the tests assert the gated SYSTEM contract (allowed runs once, blocked does
-//! not) through whichever mode the gate selected, with an anti-vacuous guard.
+//! Issues #111, #224: a bare `bind -x` on Enter runs the function without
+//! accepting the line, so the stashed command was never delivered. Enter mode
+//! now binds Enter to a MACRO that runs the checker and then a guarded
+//! accept-line, which delivers and blocks on stock bash (5.2, 5.3). A self-test
+//! (`cli::bash_capability`) still proves the capability per build and the hook
+//! falls back to preexec if it ever fails. These tests assert the gated SYSTEM
+//! contract (allowed runs once, blocked does not) through whichever mode the
+//! gate selected, with an anti-vacuous guard.
 
 #![cfg(unix)]
 
@@ -660,10 +661,11 @@ fn bash_noclobber_keeps_protocol_v3_registration() {
     );
 }
 
-/// Contract (f): a hook that can't deliver in enter mode must degrade VISIBLY,
-/// never silently — the safety floor. `TIRITH_BASH_MODE=enter` forces enter
-/// (overriding the gate's preexec pick here); the pending-not-consumed safety
-/// net must then fire loudly and persist the safe-mode flag.
+/// Contract (f): a hook that can't set up enter mode must degrade VISIBLY,
+/// never silently — the safety floor. `TIRITH_BASH_MODE=enter` forces enter,
+/// and `_TIRITH_TEST_FAIL_HEALTH=1` (a shell-local, since the hook clears any
+/// EXPORTED test override) forces the startup health gate to fail, so the
+/// degrade-to-preexec path must fire loudly and persist the safe-mode flag.
 #[test]
 fn bash_enter_degradation_is_visible_not_silent() {
     let mut env = IsolatedEnv::new();
@@ -680,28 +682,21 @@ fn bash_enter_degradation_is_visible_not_silent() {
     sess.send_line("export PS1='TIRITH_PTY> '");
     sess.expect("TIRITH_PTY> ");
     sess.clear_buffer();
-    let hook = embedded_hook("bash-hook.bash");
-    sess.send_line(&format!("source '{}'", hook.display()));
+    // Shell-local (not exported): the hook keeps a session-local test override
+    // but strips an inherited/exported one, so this must be set in-shell.
+    sess.send_line("_TIRITH_TEST_FAIL_HEALTH=1");
     sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    let hook = embedded_hook("bash-hook.bash");
+    // The degrade banner is printed while the hook is sourced.
+    sess.send_line(&format!("source '{}'", hook.display()));
+    let out = sess.expect_within("enter mode failed", Duration::from_secs(15));
     sess.wait_idle(QUIET, SETTLE_MAX);
-    sess.clear_buffer();
-
-    // First Enter: `_tirith_enter` captures a pending command but the line is
-    // never accepted in this PTY (#111). It's a WARNED command (shortened URL)
-    // so `tirith check` prints a visible warning — `expect`ing it is race-free
-    // proof the first `_tirith_enter` ran and set `_TIRITH_PENDING_EVAL`.
-    sess.send_line("echo https://bit.ly/enterprobe");
-    sess.expect("bit.ly/enterprobe");
-    sess.clear_buffer();
-    // Second Enter: the hook sees the un-consumed pending command and must
-    // announce a degrade to preexec; `expect` polls patiently for the banner.
-    sess.send_line("echo trigger_degrade");
-    let out = sess.expect_within("protection downgraded", Duration::from_secs(15));
     sess.close();
 
     assert!(
-        out.contains("protection downgraded to warn-only") || out.contains("enter mode failed"),
-        "enter mode losing delivery must print a visible degrade message, got:\n{out}"
+        out.contains("enter mode failed") || out.contains("protection downgraded to warn-only"),
+        "a failed enter-mode setup must print a visible degrade message, got:\n{out}"
     );
     // A visible degrade must also be a *persisted* one, so the next shell
     // starts safe.
@@ -818,11 +813,11 @@ fn bash_enter_blocked_command_does_not_execute() {
     );
 }
 
-/// The capability cache steers the hook's default mode, observable through
-/// behaviour: a `broken`/stale verdict → preexec (delivers → marker written); a
-/// `works` verdict for the running bash → enter (broken in this PTY → swallowed
-/// → marker absent). So a written marker proves preexec, an absent one enter —
-/// demonstrating why the gate exists.
+/// The capability cache steers the hook's default mode, observable through the
+/// exported `TIRITH_BASH_EFFECTIVE_MODE`: a `broken`/stale verdict → preexec, a
+/// `works` verdict for the running bash → enter. (Since the macro-dispatch fix,
+/// both modes deliver a command, so delivery alone no longer distinguishes
+/// them; the exported effective mode does.)
 #[test]
 fn bash_capability_cache_steers_default_mode() {
     let bash = match modern_bash() {
@@ -841,16 +836,13 @@ fn bash_capability_cache_steers_default_mode() {
     };
     let hook = embedded_hook("bash-hook.bash");
 
-    // Returns whether the marker was written (true ⇒ preexec delivered, false ⇒
-    // enter swallowed) for a seeded verdict. `seed_bash` is the cache's bash
-    // path: the real spawn path makes the verdict apply, a bogus one reads stale.
-    // No terminal output, so `wait_for_marker` polls the file (a `false` waits
-    // out `MARKER_MAX` to be sure the marker never appears).
-    let marker_written =
-        |verdict: &str, seed_bash_ver: &str, seed_bash: &Path, tag: &str| -> bool {
+    // Returns the exported effective mode ("enter" or "preexec") the hook
+    // selected for a seeded verdict. `seed_bash` is the cache's bash path: the
+    // real spawn path makes the verdict apply, a bogus one reads stale.
+    let effective_mode =
+        |verdict: &str, seed_bash_ver: &str, seed_bash: &Path, _tag: &str| -> String {
             let env = IsolatedEnv::new();
             env.seed_bash_enter_capability(verdict, seed_bash_ver, seed_bash);
-            let marker = env.workdir.join(format!("steer_{tag}.txt"));
             let mut sess = PtySession::spawn(&env, &bash, &["--norc", "--noprofile", "-i"]);
             sess.send_line("export PS1='TIRITH_PTY> '");
             sess.expect("TIRITH_PTY> ");
@@ -859,42 +851,121 @@ fn bash_capability_cache_steers_default_mode() {
             sess.expect("TIRITH_PTY> ");
             sess.wait_idle(QUIET, SETTLE_MAX);
             sess.clear_buffer();
-            sess.send_line(&format!("printf 'STEERED\\n' >> '{}'", marker.display()));
-            let body = wait_for_marker(&marker, "STEERED", MARKER_MAX);
+            // The `%s` stays literal in the command echo, so waiting for the
+            // substituted value never matches the echoed command line.
+            sess.send_line("printf 'TIRITHMODE<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"");
+            let out = sess.expect_any(
+                &["TIRITHMODE<enter>", "TIRITHMODE<preexec>"],
+                Duration::from_secs(10),
+            );
             sess.close();
-            count_occurrences(&body, "STEERED") == 1
+            if out.contains("TIRITHMODE<enter>") {
+                "enter".to_string()
+            } else if out.contains("TIRITHMODE<preexec>") {
+                "preexec".to_string()
+            } else {
+                format!("unknown: {out}")
+            }
         };
 
-    // `broken` ⇒ preexec ⇒ delivered ⇒ marker written.
-    assert!(
-        marker_written("broken", &bash_ver, &bash, "broken"),
-        "a `broken` capability verdict must keep the hook in preexec (command must run)"
+    // `broken` ⇒ preexec.
+    assert_eq!(
+        effective_mode("broken", &bash_ver, &bash, "broken"),
+        "preexec",
+        "a `broken` capability verdict must keep the hook in preexec"
     );
 
-    // `works` for a different bash version is stale ⇒ preexec ⇒ marker written.
-    assert!(
-        marker_written("works", "1.0.0-not-this-bash", &bash, "stale_version"),
-        "a capability verdict for a different bash version must be ignored as stale \
-         (hook must stay in preexec and run the command)"
+    // `works` for a different bash version is stale ⇒ preexec.
+    assert_eq!(
+        effective_mode("works", "1.0.0-not-this-bash", &bash, "stale_version"),
+        "preexec",
+        "a capability verdict for a different bash version must be ignored as stale"
     );
 
-    // `works` for a different bash path is stale ⇒ preexec ⇒ marker written.
-    assert!(
-        marker_written(
+    // `works` for a different bash path is stale ⇒ preexec.
+    assert_eq!(
+        effective_mode(
             "works",
             &bash_ver,
             Path::new("/nonexistent/other/bash"),
             "stale_path"
         ),
-        "a capability verdict for a different bash path must be ignored as stale \
-         (hook must stay in preexec and run the command)"
+        "preexec",
+        "a capability verdict for a different bash path must be ignored as stale"
     );
 
-    // `works` for this exact bash ⇒ enter ⇒ swallowed in this PTY ⇒ no marker.
+    // `works` for this exact bash ⇒ enter.
+    assert_eq!(
+        effective_mode("works", &bash_ver, &bash, "works"),
+        "enter",
+        "a `works` capability verdict must make the hook select enter mode"
+    );
+}
+
+/// The macro-dispatch enter mechanism (issues #111, #224): forcing enter mode
+/// must DELIVER an allowed command exactly once and BLOCK a dangerous one,
+/// with no preexec enforcement and no capability cache. This is the direct
+/// proof that the fix makes bash enter mode functional on the running bash.
+#[test]
+fn bash_enter_mode_delivers_and_blocks() {
+    let mut env = IsolatedEnv::new();
+    let bash = match modern_bash() {
+        Some(b) => b,
+        None => {
+            eprintln!("skipping: no modern bash (>= 5) found");
+            return;
+        }
+    };
+    // Force enter (bypasses the capability gate) and skip preexec enforcement,
+    // so a blocked command is stopped ONLY if enter mode itself blocks.
+    env.set("TIRITH_BASH_MODE", "enter");
+    let allowed = env.workdir.join("enter_allowed.txt");
+    let blocked = env.workdir.join("enter_blocked.txt");
+
+    let mut sess = PtySession::spawn(&env, &bash, &["--norc", "--noprofile", "-i"]);
+    sess.send_line("export PS1='TIRITH_PTY> '");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    let hook = embedded_hook("bash-hook.bash");
+    sess.send_line(&format!("source '{}'", hook.display()));
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+
+    // Confirm the hook is actually in enter mode, not a degrade to preexec.
+    // The `%s` stays literal in the command echo, so waiting for a substituted
+    // value never matches the echoed command line.
+    sess.send_line("printf 'TIRITHMODE<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"");
+    let mode_out = sess.expect_any(
+        &["TIRITHMODE<enter>", "TIRITHMODE<preexec>"],
+        Duration::from_secs(10),
+    );
     assert!(
-        !marker_written("works", &bash_ver, &bash, "works"),
-        "a `works` capability verdict must make the hook select enter mode \
-         (which, in this PTY, swallows the command — marker must be absent)"
+        mode_out.contains("TIRITHMODE<enter>"),
+        "forced enter mode must not degrade at startup, got:\n{mode_out}"
+    );
+    sess.clear_buffer();
+
+    // Allowed, side-effect-only command must be delivered exactly once.
+    sess.send_line(&format!("printf 'RAN\\n' >> '{}'", allowed.display()));
+    let allowed_body = wait_for_marker(&allowed, "RAN", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&allowed_body, "RAN"),
+        1,
+        "enter mode must deliver an allowed command exactly once, got: {allowed_body:?}"
+    );
+
+    // Blocked pipe-to-interpreter: the `&&`-guarded marker write runs only if
+    // the pipeline executed. Enter mode must block it.
+    sess.send_line(&format!(
+        "printf 'true' | bash && touch '{}'",
+        blocked.display()
+    ));
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.close();
+    assert!(
+        !blocked.exists(),
+        "enter mode must block a pipe-to-interpreter command"
     );
 }
 
