@@ -16,6 +16,13 @@
 
 use std::process::Command;
 
+#[path = "pty_support/mod.rs"]
+mod pty_support;
+
+fn bash_under_test() -> std::path::PathBuf {
+    pty_support::modern_bash().unwrap_or_else(|| std::path::PathBuf::from("bash"))
+}
+
 fn hook_path() -> String {
     format!(
         "{}/assets/shell/lib/bash-hook.bash",
@@ -60,7 +67,7 @@ fn split_test_env(extra_env: &[(&str, &str)]) -> (String, Vec<(String, String)>)
 /// `Command::new("bash")` reports.
 fn seed_capability_cache(state_dir: &std::path::Path, verdict: &str) {
     let (bash_version, bash_path) = {
-        let out = Command::new("bash")
+        let out = Command::new(bash_under_test())
             .args(["-c", "printf '%s\\n%s' \"$BASH_VERSION\" \"$BASH\""])
             .output()
             .expect("query bash identity");
@@ -120,7 +127,7 @@ fn source_hook_and_dump_exports(capability: Option<&str>, extra_env: &[(&str, &s
     );
 
     // Minimal env so user shell config can't influence results.
-    let mut cmd = Command::new("bash");
+    let mut cmd = Command::new(bash_under_test());
     cmd.args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -242,7 +249,7 @@ fn hook_does_not_export_in_noninteractive_shell() {
            \"${{TIRITH_STATUS:-unset}}\""
     );
 
-    let out = Command::new("bash")
+    let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -268,7 +275,7 @@ fn hook_does_not_export_in_noninteractive_shell() {
 
 #[test]
 fn failed_builtin_bootstrap_clears_stale_exports_without_calling_shadowed_export() {
-    let version = Command::new("bash")
+    let version = Command::new(bash_under_test())
         .args([
             "--norc",
             "--noprofile",
@@ -296,7 +303,7 @@ fn failed_builtin_bootstrap_clears_stale_exports_without_calling_shadowed_export
          readonly POSIXLY_CORRECT; source "$TIRITH_TEST_HOOK" 2>/dev/null;
          /bin/sh -c 'printf "CHILD_MODE=%s\nCHILD_PROT=%s\n" \
            "$TIRITH_BASH_EFFECTIVE_MODE" "$TIRITH_BASH_EFFECTIVE_PROTECTION"'"#;
-    let output = Command::new("bash")
+    let output = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-c", script])
         .env_clear()
         .env("TIRITH_TEST_HOOK", &hook)
@@ -363,7 +370,7 @@ fn status_is_not_exported_to_child_processes() {
          printf 'PARENT=%s\\n' \"${{TIRITH_STATUS:-unset}}\"; \
          bash --norc --noprofile -c 'printf \"CHILD=[%s]\\n\" \"${{TIRITH_STATUS:-}}\"'"
     );
-    let out = Command::new("bash")
+    let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -423,7 +430,7 @@ fn doctor_stdout(env: &[(&str, &str)]) -> String {
         .collect();
     let bash_script = format!("{}\n'{bin}' doctor", export_lines.join("\n"));
 
-    let out = Command::new("bash")
+    let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-c", &bash_script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -558,7 +565,7 @@ fn source_hook_run_and_dump(extra_env: &[(&str, &str)], body: &str) -> String {
            \"${{TIRITH_STATUS:-}}\""
     );
 
-    let mut cmd = Command::new("bash");
+    let mut cmd = Command::new(bash_under_test());
     cmd.args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
