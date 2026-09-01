@@ -1630,6 +1630,23 @@ _tirith_bind_x_record_is_ctrl_o() {
   [[ "$key" == '"\C-o"' ]]
 }
 
+_tirith_bind_x_has_exact_binding() {
+  local output="$1"
+  local key="$2"
+  local command="$3"
+  local line
+  # Bash 5.2 prints inputrc-style `"key": "command"` records, while 5.3
+  # omits the colon. Match complete records in either reusable format so a
+  # substring or a similarly named callback cannot satisfy the health gate.
+  while IFS= read -r line; do
+    if [[ "$line" == "\"${key}\" \"${command}\"" \
+       || "$line" == "\"${key}\": \"${command}\"" ]]; then
+      return 0
+    fi
+  done <<< "$output"
+  return 1
+}
+
 _tirith_capture_ctrl_o_bindings() {
   local map output line index
   # Bash versions that cannot enumerate bind-x entries cannot safely preserve
@@ -2153,12 +2170,12 @@ _tirith_startup_health_check() {
   local macro="$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS"
   local cm_needle="\"\\C-m\": \"$macro\""
   local cj_needle="\"\\C-j\": \"$macro\""
-  local check_needle="\"$_TIRITH_ENTER_CHECK_KEYS\" \"_tirith_enter\""
-  local accept_needle="\"$_TIRITH_ENTER_ACCEPT_KEYS\" \"_tirith_enter_accept_noop\""
   for map in "${_TIRITH_PROTECTED_KEYMAPS[@]}"; do
     xbinds="$(builtin bind -m "$map" -X 2>/dev/null)" || return 1
-    [[ "$xbinds" == *"$check_needle"* ]] || return 1
-    [[ "$xbinds" == *"$accept_needle"* ]] || return 1
+    _tirith_bind_x_has_exact_binding \
+      "$xbinds" "$_TIRITH_ENTER_CHECK_KEYS" "_tirith_enter" || return 1
+    _tirith_bind_x_has_exact_binding \
+      "$xbinds" "$_TIRITH_ENTER_ACCEPT_KEYS" "_tirith_enter_accept_noop" || return 1
     sbinds="$(builtin bind -m "$map" -s 2>/dev/null)" || return 1
     [[ "$sbinds" == *"$cm_needle"* ]] || return 1
     [[ "$sbinds" == *"$cj_needle"* ]] || return 1

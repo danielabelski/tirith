@@ -23,6 +23,10 @@ fn bash_under_test() -> std::path::PathBuf {
     pty_support::modern_bash().unwrap_or_else(|| std::path::PathBuf::from("bash"))
 }
 
+fn enter_mode_supported() -> bool {
+    pty_support::modern_bash().is_some()
+}
+
 fn hook_path() -> String {
     format!(
         "{}/assets/shell/lib/bash-hook.bash",
@@ -147,6 +151,9 @@ fn source_hook_and_dump_exports(capability: Option<&str>, extra_env: &[(&str, &s
 
 #[test]
 fn hook_exports_enter_when_capability_cache_proves_it() {
+    if !enter_mode_supported() {
+        return;
+    }
     // #111: enter mode is the default only with a proven `works` capability.
     // `_TIRITH_TEST_SKIP_HEALTH=1` skips the startup health gate (in a non-PTY
     // `bash -i -c` `bind -x` may not register, degrading enter->preexec); this
@@ -327,6 +334,9 @@ fn failed_builtin_bootstrap_clears_stale_exports_without_calling_shadowed_export
 
 #[test]
 fn hook_exports_status_blocks_in_enter_mode() {
+    if !enter_mode_supported() {
+        return;
+    }
     // A proven-`works` cache resolves to enter mode (blocks), so the prompt-facing
     // `TIRITH_STATUS` must read `blocks`.
     let out = source_hook_and_dump_exports(Some("works"), &[("_TIRITH_TEST_SKIP_HEALTH", "1")]);
@@ -359,6 +369,9 @@ fn hook_exports_status_off_before_plain_preexec_bootstrap() {
 /// child.
 #[test]
 fn status_is_not_exported_to_child_processes() {
+    if !enter_mode_supported() {
+        return;
+    }
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let hook = hook_path();
     // Use explicit enter mode with the health gate skipped so the parent has a
@@ -404,6 +417,9 @@ fn status_is_not_exported_to_child_processes() {
 /// A runtime enter->preexec auto-degrade must flip `TIRITH_STATUS` to `degraded`.
 #[test]
 fn degrade_to_preexec_exports_status_degraded() {
+    if !enter_mode_supported() {
+        return;
+    }
     let out = source_hook_run_and_dump(
         &[("_TIRITH_TEST_SKIP_HEALTH", "1")],
         "_tirith_degrade_to_preexec degrade-test",
@@ -474,6 +490,40 @@ printf 'LINE=[%s]\nPOINT=[%s]\nEVAL=[%s]\nCOMMAND=[%s]\nRECEIPT=[%s]\nDISCARDED=
             "missing {expected:?} from arm-failure rollback output:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn bind_x_health_matcher_accepts_bash_52_and_53_records() {
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let script = format!(
+        r#"source '{}'
+key='\C-x\C-t7'
+command='_tirith_enter'
+_tirith_bind_x_has_exact_binding '"\C-x\C-t7": "_tirith_enter"' "$key" "$command" || exit 70
+_tirith_bind_x_has_exact_binding '"\C-x\C-t7" "_tirith_enter"' "$key" "$command" || exit 71
+if _tirith_bind_x_has_exact_binding '"\C-x\C-t7": "_tirith_enter_suffix"' "$key" "$command"; then
+  exit 72
+fi
+if _tirith_bind_x_has_exact_binding '"\C-x\C-r7": "_tirith_enter"' "$key" "$command"; then
+  exit 73
+fi
+"#,
+        hook_path()
+    );
+    let out = Command::new(bash_under_test())
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .output()
+        .expect("exercise bind-x health matcher");
+    assert!(
+        out.status.success(),
+        "bind-x health matcher failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 // Doctor is driven off env vars; seed them directly and assert the output
@@ -650,6 +700,9 @@ fn source_hook_run_and_dump(extra_env: &[(&str, &str)], body: &str) -> String {
 /// `enter`/`blocks` values.
 #[test]
 fn degrade_to_preexec_reexports_effective_state() {
+    if !enter_mode_supported() {
+        return;
+    }
     // `_TIRITH_TEST_SKIP_HEALTH=1` keeps the hook in enter mode (else it would
     // auto-degrade at the startup gate, so the explicit degrade below wouldn't
     // be the transition under test).
