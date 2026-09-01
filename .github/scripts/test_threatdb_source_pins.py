@@ -42,6 +42,9 @@ class ThreatDbSourcePinsTests(unittest.TestCase):
         self.typosquat = self.manifest["sources"]["ecosystems_typosquatting_dataset"][
             "commit"
         ]
+        self.typosquat_timestamp = self.manifest["sources"][
+            "ecosystems_typosquatting_dataset"
+        ]["commit_timestamp"]
         self.new_ossf = "a" * 40
         self.transient_ossf = "b" * 40
         self.new_datadog = "c" * 40
@@ -61,7 +64,7 @@ class ThreatDbSourcePinsTests(unittest.TestCase):
                 "ecosyste-ms/typosquatting-dataset": [
                     commit(
                         self.typosquat,
-                        "2025-12-17T11:33:09Z",
+                        self.typosquat_timestamp,
                         "Add tools and API information",
                     )
                 ],
