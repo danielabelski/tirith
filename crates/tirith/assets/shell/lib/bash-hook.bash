@@ -2228,7 +2228,9 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       if [[ -z "$READLINE_LINE" ]]; then
         READLINE_LINE=""
         READLINE_POINT=0
-        _tirith_enter_arm_accept
+        if ! _tirith_enter_arm_accept; then
+          _tirith_degrade_to_preexec "could not arm guarded accept-line" || true
+        fi
         return
       fi
 

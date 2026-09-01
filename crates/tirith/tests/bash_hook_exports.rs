@@ -493,6 +493,57 @@ printf 'LINE=[%s]\nPOINT=[%s]\nEVAL=[%s]\nCOMMAND=[%s]\nRECEIPT=[%s]\nDISCARDED=
 }
 
 #[test]
+fn failed_empty_enter_accept_arm_degrades_visibly() {
+    if !enter_mode_supported() {
+        return;
+    }
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let script = format!(
+        r#"_TIRITH_TEST_SKIP_HEALTH=1
+TIRITH_BASH_MODE=enter
+source '{}' 2>/dev/null
+_tirith_ensure_prompt_hook() {{ return 0; }}
+_tirith_enter_arm_accept() {{ return 1; }}
+_tirith_degrade_to_preexec() {{
+  TIRITH_TEST_DEGRADED="$1"
+  return 0
+}}
+READLINE_LINE=""
+READLINE_POINT=0
+_tirith_enter
+printf 'DEGRADED=[%s]\nLINE=[%s]\nPOINT=[%s]\n' \
+  "${{TIRITH_TEST_DEGRADED:-}}" "$READLINE_LINE" "$READLINE_POINT"
+"#,
+        hook_path()
+    );
+    let out = Command::new(bash_under_test())
+        .args(["--norc", "--noprofile", "-i", "-c", &script])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .output()
+        .expect("exercise failed empty-line guarded-accept arming");
+    assert!(
+        out.status.success(),
+        "empty-line arm failure failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for expected in [
+        "DEGRADED=[could not arm guarded accept-line]",
+        "LINE=[]",
+        "POINT=[0]",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} from empty-line arm failure output:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn bind_x_health_matcher_accepts_bash_52_and_53_records() {
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let script = format!(
