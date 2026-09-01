@@ -235,6 +235,7 @@ fn hermes_owned_directory(path: &Path, effective_uid: u32) -> bool {
         metadata.file_type().is_dir()
             && metadata.uid() == effective_uid
             && metadata.mode() & 0o022 == 0
+            && tirith_core::trusted_child::validate_unix_trusted_path_acl(path, true).is_ok()
     })
 }
 
@@ -247,6 +248,7 @@ fn hermes_owned_executable(path: &Path, effective_uid: u32) -> bool {
             && metadata.uid() == effective_uid
             && metadata.mode() & 0o022 == 0
             && metadata.mode() & 0o111 != 0
+            && tirith_core::trusted_child::validate_unix_trusted_path_acl(path, false).is_ok()
     })
 }
 
@@ -259,7 +261,8 @@ fn cargo_install_metadata_exists(root: &Path) -> bool {
 
 /// Prove that the running canonical executable is exactly a safely owned Hermes
 /// release cache. Every traversed directory and the executable must be
-/// same-UID, non-symlink, and not group/world-writable.
+/// same-UID, non-symlink, and free of mode-bit or ACL write grants to other
+/// principals.
 #[cfg(unix)]
 fn hermes_install_path_is_proven(canonical_binary: &Path, root: Option<&Path>) -> bool {
     use std::path::Component;
@@ -3371,6 +3374,37 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn linux_acl_blob(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut blob = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in entries {
+            blob.extend_from_slice(&tag.to_le_bytes());
+            blob.extend_from_slice(&permissions.to_le_bytes());
+            blob.extend_from_slice(&id.to_le_bytes());
+        }
+        blob
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_linux_acl(path: &Path, name: &str, blob: &[u8]) {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = std::ffi::CString::new(name).unwrap();
+        // SAFETY: both strings are NUL-terminated and blob is readable for its
+        // complete declared length.
+        let status = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                blob.as_ptr().cast(),
+                blob.len(),
+                0,
+            )
+        };
+        assert_eq!(status, 0, "setxattr: {}", std::io::Error::last_os_error());
+    }
+
     #[cfg(unix)]
     #[test]
     fn hermes_root_must_be_absolute_normalized_and_outside_system_roots() {
@@ -3458,6 +3492,91 @@ mod tests {
         assert!(!hermes_install_path_is_proven(
             &real_binary.canonicalize().unwrap(),
             Some(symlink_root.as_path())
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hermes_install_proof_rejects_foreign_write_acl_entries() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const ACL_USER_OBJ: u16 = 0x01;
+        const ACL_USER: u16 = 0x02;
+        const ACL_GROUP_OBJ: u16 = 0x04;
+        const ACL_MASK: u16 = 0x10;
+        const ACL_OTHER: u16 = 0x20;
+        const UNDEFINED_ID: u32 = u32::MAX;
+
+        // SAFETY: geteuid has no preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+        let foreign_uid = if effective_uid == 1 { 2 } else { 1 };
+        assert_ne!(foreign_uid, 0);
+        assert_ne!(foreign_uid, effective_uid);
+        let access_acl = linux_acl_blob(&[
+            (ACL_USER_OBJ, 7, UNDEFINED_ID),
+            (ACL_USER, 7, foreign_uid),
+            (ACL_GROUP_OBJ, 5, UNDEFINED_ID),
+            // Keep the named write entry masked off so the ordinary mode stays
+            // 0755; the trusted-path ACL policy must still see and reject it.
+            (ACL_MASK, 5, UNDEFINED_ID),
+            (ACL_OTHER, 5, UNDEFINED_ID),
+        ]);
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("access-acl-hermes");
+        let bin = root.join("bin");
+        create_owned_test_dir_all(&root, &bin);
+        let binary = bin.join("tirith");
+        write_owned_test_executable(&binary);
+        set_linux_acl(&binary, "system.posix_acl_access", &access_acl);
+        assert_eq!(
+            std::fs::metadata(&binary).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!hermes_install_path_is_proven(
+            &binary.canonicalize().unwrap(),
+            Some(root.as_path())
+        ));
+
+        let default_acl = linux_acl_blob(&[
+            (ACL_USER_OBJ, 7, UNDEFINED_ID),
+            (ACL_USER, 7, foreign_uid),
+            (ACL_GROUP_OBJ, 5, UNDEFINED_ID),
+            (ACL_MASK, 7, UNDEFINED_ID),
+            (ACL_OTHER, 5, UNDEFINED_ID),
+        ]);
+        let default_root = directory.path().join("default-acl-hermes");
+        let default_bin = default_root.join("bin");
+        create_owned_test_dir_all(&default_root, &default_bin);
+        let default_binary = default_bin.join("tirith");
+        write_owned_test_executable(&default_binary);
+        set_linux_acl(&default_bin, "system.posix_acl_default", &default_acl);
+        assert_eq!(
+            std::fs::metadata(&default_bin)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(!hermes_install_path_is_proven(
+            &default_binary.canonicalize().unwrap(),
+            Some(default_root.as_path())
+        ));
+
+        // A default ACL that names only the current owner is benign and keeps
+        // inherited GitHub-runner-style self grants compatible with Hermes.
+        let self_acl = linux_acl_blob(&[
+            (ACL_USER_OBJ, 7, UNDEFINED_ID),
+            (ACL_USER, 7, effective_uid),
+            (ACL_GROUP_OBJ, 5, UNDEFINED_ID),
+            (ACL_MASK, 7, UNDEFINED_ID),
+            (ACL_OTHER, 5, UNDEFINED_ID),
+        ]);
+        set_linux_acl(&default_bin, "system.posix_acl_default", &self_acl);
+        assert!(hermes_install_path_is_proven(
+            &default_binary.canonicalize().unwrap(),
+            Some(default_root.as_path())
         ));
     }
 
