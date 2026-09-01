@@ -1630,6 +1630,14 @@ _tirith_bind_x_record_is_ctrl_o() {
   [[ "$key" == '"\C-o"' ]]
 }
 
+_tirith_bind_output_has_ctrl_o() {
+  local output="$1" line
+  while IFS= read -r line; do
+    _tirith_bind_x_record_is_ctrl_o "$line" && return 0
+  done <<< "$output"
+  return 1
+}
+
 _tirith_bind_x_has_exact_binding() {
   local output="$1"
   local key="$2"
@@ -1707,7 +1715,7 @@ _tirith_restore_ctrl_o_bindings() {
         builtin bind -m "$map" "$binding" 2>/dev/null || restore_rc=1
         ;;
       *)
-        builtin bind -m "$map" -r '"\C-o"' 2>/dev/null || true
+        builtin bind -m "$map" -r '\C-o' 2>/dev/null || restore_rc=1
         ;;
     esac
   done
@@ -1729,11 +1737,11 @@ _tirith_degrade_to_preexec() {
       builtin bind -m "$_tirith_keymap" '"\C-j": accept-line' 2>/dev/null || true
       # Unbind the macro-dispatch helper sequences (checker + guarded accept)
       # so no stale binding survives the degrade in any switchable keymap.
-      builtin bind -m "$_tirith_keymap" -r '"\C-x\C-t7"' 2>/dev/null || true
-      builtin bind -m "$_tirith_keymap" -r '"\C-x\C-r7"' 2>/dev/null || true
+      builtin bind -m "$_tirith_keymap" -r "$_TIRITH_ENTER_CHECK_KEYS" 2>/dev/null || true
+      builtin bind -m "$_tirith_keymap" -r "$_TIRITH_ENTER_ACCEPT_KEYS" 2>/dev/null || true
       # Restore bracketed paste to the Readline default if available.
       builtin bind -m "$_tirith_keymap" '"\e[200~": bracketed-paste-begin' \
-        2>/dev/null || builtin bind -m "$_tirith_keymap" -r '"\e[200~"' 2>/dev/null || true
+        2>/dev/null || builtin bind -m "$_tirith_keymap" -r '\e[200~' 2>/dev/null || true
     done
     _tirith_restore_ctrl_o_bindings || true
     _TIRITH_BINDS_INSTALLED=0
@@ -1811,7 +1819,16 @@ _tirith_prompt_hook() {
   # accept-line until this runs, so disarming here closes the window in which
   # an injected accept sequence could accept a line the checker never approved.
   if declare -F _tirith_enter_disarm_accept >/dev/null 2>&1; then
-    _tirith_enter_disarm_accept
+    if ! _tirith_enter_disarm_accept; then
+      local failed_pending_receipt="${_TIRITH_PENDING_RECEIPT:-}"
+      unset _TIRITH_PENDING_EVAL
+      unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
+      if [[ -n "$failed_pending_receipt" ]]; then
+        _tirith_receipt_discard bash-enter "$failed_pending_receipt" || true
+      fi
+      _tirith_degrade_to_preexec "could not disarm guarded accept-line" || true
+      return
+    fi
   fi
   local pending_eval="${_TIRITH_PENDING_EVAL:-}"
   local pending_receipt="${_TIRITH_PENDING_RECEIPT:-}"
@@ -2164,7 +2181,7 @@ _tirith_startup_health_check() {
   # Test-only override for CI (avoids needing PTY)
   [[ "${_TIRITH_TEST_FAIL_HEALTH:-}" == "1" ]] && return 1
   # The checker must be installed as a bind -x function.
-  local map xbinds sbinds
+  local map xbinds sbinds pbinds
   # Both \C-m and \C-j must map to the checker+accept Enter macro in every
   # primary keymap. A later `set -o vi` must not expose an unguarded accept-line.
   local macro="$_TIRITH_ENTER_CHECK_KEYS$_TIRITH_ENTER_ACCEPT_KEYS"
@@ -2176,9 +2193,13 @@ _tirith_startup_health_check() {
       "$xbinds" "$_TIRITH_ENTER_CHECK_KEYS" "_tirith_enter" || return 1
     _tirith_bind_x_has_exact_binding \
       "$xbinds" "$_TIRITH_ENTER_ACCEPT_KEYS" "_tirith_enter_accept_noop" || return 1
+    _tirith_bind_output_has_ctrl_o "$xbinds" && return 1
     sbinds="$(builtin bind -m "$map" -s 2>/dev/null)" || return 1
     [[ "$sbinds" == *"$cm_needle"* ]] || return 1
     [[ "$sbinds" == *"$cj_needle"* ]] || return 1
+    _tirith_bind_output_has_ctrl_o "$sbinds" && return 1
+    pbinds="$(builtin bind -m "$map" -p 2>/dev/null)" || return 1
+    _tirith_bind_output_has_ctrl_o "$pbinds" && return 1
   done
   # Verify prompt hook is still attached
   _tirith_is_prompt_hook_attached || return 1
@@ -2578,7 +2599,8 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         builtin bind -m "$_tirith_keymap" -x '"\e[200~": _tirith_paste' \
           || _tirith_bind_install_ok=0
         # operate-and-get-next accepts the current line without the checker.
-        builtin bind -m "$_tirith_keymap" -r '"\C-o"' 2>/dev/null || true
+        builtin bind -m "$_tirith_keymap" -r '\C-o' 2>/dev/null \
+          || _tirith_bind_install_ok=0
       done
       _tirith_enter_disarm_accept || _tirith_bind_install_ok=0
       _TIRITH_BINDS_INSTALLED=1

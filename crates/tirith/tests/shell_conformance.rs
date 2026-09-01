@@ -1046,10 +1046,26 @@ fn bash_enter_degradation_restores_custom_ctrl_o_bindings() {
     sess.send_line(&format!("source '{}'", hook.display()));
     sess.expect("TIRITH_PTY> ");
     sess.clear_buffer();
+    sess.send_line("printf 'TIRITH_CTRL_O_MODE<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"");
+    let mode_output = sess.expect_any(
+        &["TIRITH_CTRL_O_MODE<enter>", "TIRITH_CTRL_O_MODE<preexec>"],
+        Duration::from_secs(10),
+    );
+    assert!(
+        mode_output.contains("TIRITH_CTRL_O_MODE<enter>"),
+        "enter mode must remove every captured Ctrl-O bypass before its health gate, got:\n{mode_output}"
+    );
+    sess.clear_buffer();
     sess.send_line(
         r#"if _tirith_bind_x_record_is_ctrl_o '"\C-o" "printf modern"' && _tirith_bind_x_record_is_ctrl_o '"\C-o": "printf legacy"'; then printf 'TIRITH_CTRL_O_RECORDS_%s\n' OK; else printf 'TIRITH_CTRL_O_RECORDS_%s\n' BAD; fi"#,
     );
     sess.expect("TIRITH_CTRL_O_RECORDS_OK");
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
+    sess.send_line(
+        r#"bind -m emacs-standard '"\C-o": operate-and-get-next'; if _tirith_startup_health_check; then printf 'TIRITH_CTRL_O_HEALTH_%s\n' BAD; else printf 'TIRITH_CTRL_O_HEALTH_%s\n' OK; fi"#,
+    );
+    sess.expect("TIRITH_CTRL_O_HEALTH_OK");
     sess.expect("TIRITH_PTY> ");
     sess.clear_buffer();
     sess.send_line("_tirith_degrade_to_preexec ctrl-o-test");

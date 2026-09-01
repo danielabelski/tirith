@@ -544,6 +544,65 @@ printf 'DEGRADED=[%s]\nLINE=[%s]\nPOINT=[%s]\n' \
 }
 
 #[test]
+fn failed_accept_disarm_drops_pending_delivery_before_degrading() {
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let token = "b".repeat(64);
+    let script = format!(
+        r#"source '{}'
+_TIRITH_RECEIPT_PROTOCOL=3
+_tirith_enter_disarm_accept() {{ return 1; }}
+_tirith_receipt_discard() {{
+  [[ "$1:$2" == "bash-enter:{}" ]] || return 9
+  TIRITH_TEST_DISCARDED=yes
+}}
+_tirith_degrade_to_preexec() {{
+  TIRITH_TEST_DEGRADED="$1"
+  return 0
+}}
+_TIRITH_PENDING_EVAL='TIRITH_TEST_EVAL_RAN=yes'
+_TIRITH_PENDING_COMMAND='printf approved'
+_TIRITH_PENDING_RECEIPT='{}'
+_tirith_prompt_hook
+printf 'EVAL_RAN=[%s]\nEVAL=[%s]\nCOMMAND=[%s]\nRECEIPT=[%s]\nDISCARDED=[%s]\nDEGRADED=[%s]\n' \
+  "${{TIRITH_TEST_EVAL_RAN:-}}" "${{_TIRITH_PENDING_EVAL+x}}" \
+  "${{_TIRITH_PENDING_COMMAND+x}}" "${{_TIRITH_PENDING_RECEIPT+x}}" \
+  "${{TIRITH_TEST_DISCARDED:-}}" "${{TIRITH_TEST_DEGRADED:-}}"
+"#,
+        hook_path(),
+        token,
+        token
+    );
+    let out = Command::new(bash_under_test())
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .output()
+        .expect("exercise failed guarded-accept disarming");
+    assert!(
+        out.status.success(),
+        "accept-disarm failure failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for expected in [
+        "EVAL_RAN=[]",
+        "EVAL=[]",
+        "COMMAND=[]",
+        "RECEIPT=[]",
+        "DISCARDED=[yes]",
+        "DEGRADED=[could not disarm guarded accept-line]",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} from accept-disarm failure output:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn bind_x_health_matcher_accepts_bash_52_and_53_records() {
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let script = format!(
