@@ -37,6 +37,10 @@ runtime_env=(
   XDG_DATA_HOME="$state_root/data"
   XDG_STATE_HOME="$state_root/state"
   TIRITH_LOG=0
+  # Runtime smoke is intentionally hermetic. An online `tirith check` may
+  # detach a threat-DB refresh that outlives the command and races this
+  # script's EXIT cleanup (GNU rm can then report "Directory not empty").
+  TIRITH_OFFLINE=1
 )
 
 version_output=$("${runtime_env[@]}" "$tirith_bin" --version 2>&1)
