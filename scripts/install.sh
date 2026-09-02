@@ -181,7 +181,7 @@ resolve_latest_version() {
   workdir="$1"
   if [ -n "$VERSION" ]; then
     validate_release_tag "$VERSION" \
-      || err "TIRITH_VERSION must be a complete semantic version (for example 0.4.0)"
+      || err "TIRITH_VERSION must be a complete semantic version (for example 0.4.1)"
     return 0
   fi
 

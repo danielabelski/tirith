@@ -124,7 +124,7 @@ cleanly** — never fails — when a prerequisite is missing:
 |--------------|--------------------|--------|
 | bash — preexec (DEBUG-trap, warn-only) | a, b, c, e, g | Passing |
 | bash — preexec with `TIRITH_BASH_PREEXEC_ENFORCE=1` | a, b, d, phase/receipt cardinality | Passing on Bash 3.2 harness + current-Bash PTY |
-| bash — enter (`bind -x` Enter override) | f | Passing |
+| bash: enter (guarded readline macro on Enter) | a, b, d, f | Passing |
 | bash — #111 capability gate | a, b, d | Passing |
 | fish | a, b, c, d, e, g | Passing |
 | zsh — ZLE accept-line (protocol v3) | a, b, d, e | Passing |
@@ -134,15 +134,27 @@ cleanly** — never fails — when a prerequisite is missing:
 
 ### Issue #111 — bash enter-mode delivery, and the capability gate
 
-Bash *enter* mode rebinds Enter to a shell function with `bind -x`. In many
-environments, `bind -x` on `\C-m` runs the bound function but **does not then
-accept the line** — so bash never returns to its command loop, `PROMPT_COMMAND`
-never fires, and the pending command (captured into `_TIRITH_PENDING_EVAL`) is
-never delivered. The command is silently eaten. This is issue #111.
+Bash *enter* mode used to rebind Enter directly to a shell function with
+`bind -x`. A bare `bind -x` on `\C-m` runs the bound function but **does not
+then accept the line**, so bash never returned to its command loop,
+`PROMPT_COMMAND` never fired, and the pending command (captured into
+`_TIRITH_PENDING_EVAL`) was never delivered. The command was silently eaten.
+That is issue #111.
 
-Whether `bind -x` accepts the line is a *capability* of the specific
-bash/readline build, not a function of the bash version number — so tirith
-cannot decide enter-vs-preexec by a version gate. The fix is **capability-based**:
+Since 0.4.1 (issue #224), enter mode binds `\C-m` and `\C-j` to a readline
+MACRO that runs the checker (still a `bind -x` function) and then a GUARDED
+accept-line. The accept sub-sequence is a no-op until `_tirith_enter` arms it,
+and `_tirith_prompt_hook` re-disarms it at every prompt, so a line is accepted
+only once the checker has decided to deliver it, and injected accept bytes on
+their own can never accept a line. `operate-and-get-next` (`\C-o`), an
+accept-line equivalent that skips the checker, is unbound while enter mode owns
+delivery, and the prior per-keymap binding is restored on degrade. This
+delivers and blocks on the stock GNU bash 5.2 and 5.3 builds it was verified
+against.
+
+Line acceptance remains a *capability* of the specific bash/readline build, not
+a function of the bash version number, so tirith still does not decide
+enter-vs-preexec by a version gate. The gate is **capability-based**:
 
 - `tirith setup` and `tirith doctor` (and the explicit
   `tirith doctor --simulate-enter`) run a disposable-PTY **self-test**
@@ -152,9 +164,9 @@ cannot decide enter-vs-preexec by a version gate. The fix is **capability-based*
   stopped.
 - The self-test writes a small `key=value` **cache file**
   (`<state-dir>/bash-enter-capability`) recording the verdict. Freshness is
-  keyed on the bash identity — `$BASH_VERSION` and the bash binary path —
-  because `bind -x` line-acceptance is a property of that specific
-  bash/readline build, not of the tirith release. The cache `schema` number is
+  keyed on the bash identity (`$BASH_VERSION` and the bash binary path)
+  because line acceptance is a property of that specific bash/readline build,
+  not of the tirith release. The cache `schema` number is
   the cross-tirith-version invalidator (any change to the probe semantics or
   cache format bumps it); the recorded `tirith_version` is diagnostic only.
 - `tirith init` is unchanged — it must stay fast because it is `eval`'d on
@@ -164,13 +176,14 @@ cannot decide enter-vs-preexec by a version gate. The fix is **capability-based*
   cache proves enter delivery works for the running bash, and otherwise falls
   back to the safe default, preexec.
 
-The harness reproduces #111 precisely (its bare PTY is an environment where
-`bind -x` delivery is broken), so the capability-correct behaviour there is the
-fallback to preexec. The regression tests assert the **capability-gated system
-contract** rather than a literal enter-mode contract — a literal enter-mode
-"blocked command did not run" assertion under broken delivery would pass
-*vacuously*, because a swallowed allowed command and a swallowed blocked command
-are indistinguishable:
+The harness starts every test from an empty capability cache, so the
+capability-correct behaviour there is the fallback to preexec. Its bare PTY is
+no longer a broken-delivery environment: since the macro-dispatch fix the Enter
+macro delivers there too. The regression tests still assert the
+**capability-gated system contract** rather than a literal enter-mode contract,
+because a literal "blocked command did not run" assertion passes *vacuously*
+wherever a command is swallowed: a swallowed allowed command and a swallowed
+blocked command are indistinguishable:
 
 - `bash_enter_allowed_command_executes_exactly_once` — with no proven enter
   capability, the hook falls back to preexec and delivers an allowed command
@@ -186,6 +199,16 @@ are indistinguishable:
   an explicit override that forces enter even when the gate would pick preexec;
   a forced-but-broken enter mode must still degrade *visibly* and persist the
   safe-mode flag (invariant f).
+- `bash_enter_mode_delivers_and_blocks`: forces enter mode with no cached
+  verdict and no preexec enforcement, then asserts an allowed command is
+  delivered exactly once and a blocked one leaves no marker. This is the
+  literal enter-mode contract, now that the macro makes it non-vacuous.
+- `bash_enter_mode_protects_vi_keymaps_after_runtime_switch`: a `set -o vi`
+  after the hook loaded must not expose an unguarded Enter; `vi-insert` and
+  `vi-command` carry the same macro as `emacs-standard`.
+- `bash_enter_degradation_restores_custom_ctrl_o_bindings`: a user's own
+  `\C-o` binding is captured per keymap while enter mode unbinds it, and
+  restored exactly on degrade.
 
 The capability-cache reader's robustness against hostile bash history
 configuration (`HISTCONTROL`, `HISTIGNORE`, `set +o history`, a pre-set `IFS`,

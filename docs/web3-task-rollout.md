@@ -86,10 +86,14 @@ repo-policy sanitation, and the Web3 detection findings themselves.
 
 ## Stage 0: before merge (release owner)
 
-1. **Pause the scheduled ThreatDB workflow** and independently verify the
-   disabled state. The workflow is `.github/workflows/threatdb.yml` on a
-   `15 4 * * *` cron. It must not run against the corrected compiler until the
-   shadow build has been reviewed.
+1. **Pause both scheduled ThreatDB workflows** and independently verify the
+   disabled state. They are `.github/workflows/threatdb.yml` on a `15 4 * * *`
+   cron and `.github/workflows/threatdb-source-pins.yml` on a `37 2 * * *`
+   cron. Neither may run against the corrected compiler until the shadow build
+   has been reviewed: the pin watcher builds `tirith-threatdb-compile` from the
+   tree and compiles candidate snapshots, and it opens or refreshes a pin-bump
+   PR against `.github/threatdb-source-pins.json` whenever an upstream revision
+   moves.
 2. **Keep the signed last-known-good database active** for clients throughout.
 3. **Run one full shadow ThreatDB build** against pinned live-shape snapshots.
    Record per-source accepted, rejected, withdrawn, and unresolved counts, and
