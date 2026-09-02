@@ -1,0 +1,160 @@
+name: ThreatDB source pin watcher
+
+on:
+  schedule:
+    - cron: "37 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: threatdb-source-pin-watcher
+  cancel-in-progress: false
+
+# Discovery uses this read-only token. Publishing the reviewed candidate branch
+# requires the separately scoped THREATDB_PIN_PR_TOKEN and happens only after a
+# real fetch and compile. This workflow has no signing key or release permission.
+permissions:
+  contents: read
+
+jobs:
+  propose:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Discover completed upstream revisions
+        id: pins
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/threatdb-source-pin-report.md"
+          result="$RUNNER_TEMP/threatdb-source-pin-result.json"
+          python3 .github/scripts/threatdb_source_pins.py update \
+            .github/threatdb-source-pins.json \
+            --report "$report" \
+            --result "$result"
+          changed=$(jq -er '.changed | if . then "true" else "false" end' "$result")
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "report=$report" >> "$GITHUB_OUTPUT"
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate deterministic pin and fetch contracts
+        if: steps.pins.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/threatdb_source_pins.py validate \
+            .github/threatdb-source-pins.json
+          python3 .github/scripts/test_threatdb_source_pins.py
+          bash .github/scripts/test-fetch-threatdb-sources.sh
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        if: steps.pins.outputs.changed == 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.pins.outputs.changed == 'true'
+
+      - name: Build the unprivileged validation compiler
+        if: steps.pins.outputs.changed == 'true'
+        run: cargo build --locked --release -p tirith --bin tirith-threatdb-compile
+
+      - name: Fetch and compile the exact candidate snapshots
+        if: steps.pins.outputs.changed == 'true'
+        env:
+          # Public, deterministic test seed. Production signing material is not
+          # available to this workflow.
+          TIRITH_WATCHER_SIGNING_KEY: KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=
+        run: |
+          set -euo pipefail
+          fetch_root="$RUNNER_TEMP/threatdb-pin-validation"
+          THREATDB_FETCH_OUTPUT_DIR="$fetch_root" \
+            bash .github/scripts/fetch-threatdb-sources.sh
+          sources="$fetch_root/tirith-threatdb-sources"
+          ./target/release/tirith-threatdb-compile \
+            --ossf "$sources/ossf-mp" \
+            --registry-snapshots "$sources/registry-versions.json" \
+            --source-provenance "$sources/source-provenance.json" \
+            --compiler-metadata "$RUNNER_TEMP/compiler-metadata.json" \
+            --datadog "$sources/dd-mp" \
+            --feodo "$sources/feodo.txt" \
+            --cisa-kev "$sources/cisa-kev.json" \
+            --typosquats "$sources/typosquats/typosquats.csv" \
+            --sequence 1 \
+            --sign-key-env TIRITH_WATCHER_SIGNING_KEY \
+            --output "$RUNNER_TEMP/tirith-threatdb-candidate.dat"
+
+      - name: Require the dedicated PR token
+        if: steps.pins.outputs.changed == 'true'
+        env:
+          PIN_PR_TOKEN: ${{ secrets.THREATDB_PIN_PR_TOKEN }}
+        run: |
+          if [ -z "$PIN_PR_TOKEN" ]; then
+            echo "::error::THREATDB_PIN_PR_TOKEN is required (contents + pull requests for this repository only)"
+            exit 1
+          fi
+
+      - name: Publish the automation-owned candidate branch
+        if: steps.pins.outputs.changed == 'true'
+        id: branch
+        env:
+          PIN_PR_TOKEN: ${{ secrets.THREATDB_PIN_PR_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="automation/threatdb-source-pins"
+          git config user.name "tirith-threatdb-pin-watcher[bot]"
+          git config user.email "tirith-threatdb-pin-watcher[bot]@users.noreply.github.com"
+          git fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch" || true
+          expected=$(git rev-parse --verify "refs/remotes/origin/$branch" 2>/dev/null || true)
+          git switch -c "$branch"
+          git add .github/threatdb-source-pins.json
+          git commit -m "chore(threatdb): refresh source pins"
+
+          askpass="$RUNNER_TEMP/tirith-pin-git-askpass.sh"
+          cat > "$askpass" <<'SCRIPT'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$PIN_PR_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SCRIPT
+          chmod 700 "$askpass"
+          lease="--force-with-lease=refs/heads/$branch:$expected"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git push "$lease" "https://github.com/$GITHUB_REPOSITORY.git" \
+            "HEAD:refs/heads/$branch"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Open or refresh the review PR
+        if: steps.pins.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.THREATDB_PIN_PR_TOKEN }}
+          REPORT: ${{ steps.pins.outputs.report }}
+          SOURCE_BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          set -euo pipefail
+          head="$GITHUB_REPOSITORY_OWNER:$SOURCE_BRANCH"
+          number=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --head "$head" \
+            --json number \
+            --jq '.[0].number // empty')
+          if [ -z "$number" ]; then
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$SOURCE_BRANCH" \
+              --title "chore(threatdb): refresh source pins" \
+              --body-file "$REPORT"
+          else
+            gh pr edit "$number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "chore(threatdb): refresh source pins" \
+              --body-file "$REPORT"
+          fi

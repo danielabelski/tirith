@@ -25,6 +25,16 @@ grep -Fq 'FETCH_TIMEOUT_SECONDS=${THREATDB_FETCH_TIMEOUT_SECONDS:-300}' "$FETCH_
 cat > "$FAKE_BIN/git" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+# `git -C <dir> show ...` records the source commit timestamp in provenance.
+if [[ "$*" == *" show "* ]] && [[ "$*" == *"--format=%cI"* ]]; then
+  case "$2" in
+    *ossf-mp) echo "2026-08-31T18:32:57+00:00" ;;
+    *dd-mp) echo "2026-08-31T04:05:01+00:00" ;;
+    *typosquats) echo "2025-12-17T11:33:09+00:00" ;;
+    *) exit 64 ;;
+  esac
+  exit 0
+fi
 # `git -C <dir> rev-parse HEAD` records the resolved source revision.
 if [[ "$*" == *rev-parse* ]]; then
   case "$2" in
@@ -634,6 +644,10 @@ grep -Eq '"spdx"[[:space:]]*:[[:space:]]*"LicenseRef-Package-Name-Facts"' \
 grep -Eq '"content_sha256"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"' \
   "$published/source-provenance.json"
 grep -Eq '"retrieved_at"[[:space:]]*:[[:space:]]*"[0-9]{4}-[0-9]{2}-[0-9]{2}T' \
+  "$published/source-provenance.json"
+grep -Eq '"commit_timestamp"[[:space:]]*:[[:space:]]*"2026-08-31T18:32:57Z"' \
+  "$published/source-provenance.json"
+grep -Eq '"pin_selected_at"[[:space:]]*:[[:space:]]*"2026-08-31T19:22:30Z"' \
   "$published/source-provenance.json"
 
 # The single-process tree hasher must remain byte-for-byte compatible with the
