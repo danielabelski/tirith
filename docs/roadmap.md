@@ -80,10 +80,21 @@ The release also includes:
 The [0.4.0 release notes](release-notes-0.4.0.md) are the detailed feature,
 upgrade, compatibility, and limitation inventory.
 
-## 0.4.0 publication contract
+## Published: 0.4.1
 
-0.4.0 is cut only from the final default-branch tree after the cross-platform
-and package-assembly gates pass on that exact commit. Its known issues are
+A patch release on the same line. It adds no command and changes no schema. The
+one behavioural change is that bash enter mode now delivers and blocks, so an
+ordinary bash install blocks instead of only warning; the remaining entries fix
+silent downgrades to legacy mode through symlinked installs and zsh prompt
+frameworks, correct several misleading advisories, recognize safely owned
+Hermes installs as self-replaceable, and move ThreatDB source pinning onto one
+reviewed manifest with a proposal-only watcher. The
+[0.4.1 release notes](release-notes-0.4.1.md) carry the upgrade guidance.
+
+## Publication contract
+
+A release is cut only from the final default-branch tree after the cross-platform
+and package-assembly gates pass on that exact commit. Known issues are
 explicitly deferred in the changelog, and publication uses the protected,
 single-use tag workflow. Registry state is verified independently after the
 workflow completes; Chocolatey moderation and Homebrew core bottle publication

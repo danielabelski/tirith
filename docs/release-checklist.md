@@ -1,10 +1,12 @@
 # Release Checklist
 
-## 0.4.0 release sequence
+## Release sequence
 
-The changelog and release notes describe the final 0.4.0 tree. The workspace
-version stays on the previous release until the integration tree is known, then
-the release commit performs the version and documentation transition below:
+Substitute the release version for `<VERSION>` throughout (for example `0.4.1`,
+tagged `v0.4.1`). The changelog and release notes describe the final tree. The
+workspace version stays on the previous release until the integration tree is
+known, then the release commit performs the version and documentation
+transition below:
 
 1. Rebase or merge the complete integration stack onto the final default-branch
    tip and review the resulting tree, not only each stacked diff.
@@ -12,20 +14,49 @@ the release commit performs the version and documentation transition below:
 3. Run the required Linux, macOS, and Windows matrices on that exact tree,
    including native x86_64-Linux containment and host-shaped hook tests.
 4. Complete the Web3/task and ThreatDB v2 rollout playbooks below.
-5. Change the workspace version to `0.4.0`, update Cargo lockfiles, regenerate
+5. Change the workspace version to `<VERSION>` in BOTH root `Cargo.toml`
+   lines (`[workspace.package] version` and the `[workspace.dependencies]
+   tirith-core` version), regenerate `Cargo.lock` AND `fuzz/Cargo.lock` (a
+   separate cargo workspace; `.github/workflows/fuzz.yml` runs
+   `cargo +nightly fetch --manifest-path fuzz/Cargo.toml --locked` followed by
+   `git diff --exit-code`, and fuzz-gate blocks the release job), regenerate
    generated documentation/fixtures through their owning commands, and confirm
    every package template is materialized from the tag as designed. Do not
    hand-edit generated capability or evidence files.
 6. Move the changelog content from `[Unreleased]` to
-   `[0.4.0] - YYYY-MM-DD`, remove the draft banner from the release notes, and
-   ensure README installation text does not claim a registry has 0.4.0 before
-   that registry actually does.
+   `[<VERSION>] - YYYY-MM-DD`, write `docs/release-notes-<VERSION>.md` (the
+   release job publishes the GitHub Release body from that exact path and
+   silently falls back to auto-generated commit titles when it is missing),
+   retarget the release-notes links in `README.md`, `TIRITH.md`, and
+   `docs/compatibility.md`, and ensure README installation text does not claim
+   a registry has `<VERSION>` before that registry actually does.
 7. Run package assembly and the full release-validation workflow before pushing
-   the protected `v0.4.0` tag.
+   the protected `v<VERSION>` tag.
 
-Version 0.4.0 is intentional: it is the next minor after 0.3.3 and reflects the
-new commands, policy/document schemas, integrations, and enforcement surfaces.
-Skipping directly to 0.5.0 would create an unexplained empty 0.4 release line.
+### Do not touch as part of a version bump
+
+- `npm/*/package.json` and every `packaging/` template (Homebrew, Scoop, AUR,
+  Chocolatey, RPM). The release workflow rewrites all of them from the tag, and
+  their checked-in versions are deliberately stale placeholders.
+- `V2_MIN_VERSION` in `.github/workflows/threatdb.yml`. It must equal the tag of
+  the release that FIRST shipped the DB-B reader, which is 0.4.0. Bumping it on
+  a patch release would strand every earlier 0.4.x client on the v1 asset.
+- Version literals inside Rust sources and tests. Everything runtime-facing
+  reads `env!("CARGO_PKG_VERSION")`; the rest are semver fixtures or
+  `#[deprecated(since = ...)]` records of past events.
+- The `NOTICE` pinned revisions are NOT part of the version bump, but they are
+  hand-maintained and nothing in CI checks them. Whenever a ThreatDB source pin
+  moves in `.github/threatdb-source-pins.json`, update `NOTICE` to match in the
+  same cycle.
+
+### Tag timing
+
+`release-authority` requires the tag to point at the CURRENT default-branch
+commit. `.github/workflows/threatdb.yml` pushes manifest commits straight to
+`main` on its own schedule, and observed pushes span a wide range of hours, so
+do not rely on a quiet window. Either disable the Threat DB Build workflow for
+the release window, or confirm `git rev-parse origin/main` still equals the
+release commit immediately before pushing the tag and re-tag if it moved.
 
 ## Feature-specific rollout playbooks
 
@@ -154,7 +185,7 @@ Push a `v*` tag → GitHub Actions workflow builds, compatibility-tests, then pu
 Homebrew core is separate from the tap publication. After the release exists,
 follow [the Homebrew core update guide](homebrew-core.md) and verify the core
 formula/bottles independently before describing `brew install tirith` as
-serving 0.4.0 everywhere.
+serving the new version everywhere.
 
 ## Post-publication verification
 
@@ -162,14 +193,16 @@ serving 0.4.0 everywhere.
   and RPM package, installer, checksums, signature, certificate, SBOM, and
   provenance artifact. Re-run verification against the downloaded public
   bytes, not the runner workspace.
-- Verify `tirith` and `tirith-core` 0.4.0 on crates.io and all six exact 0.4.0
-  npm packages. Test one clean and one blocked command through an installed npm
+- Verify `tirith` and `tirith-core` at `<VERSION>` on crates.io and all six
+  exact `<VERSION>` npm packages (the unscoped root `tirith` plus the five
+  scoped `@sheeki03/tirith-*` platform packages; a scoped `@sheeki03/tirith` is
+  absent by design). Test one clean and one blocked command through an installed npm
   platform wrapper.
 - Verify the Homebrew tap, Scoop bucket, GHCR architecture manifest, and AUR
   package all resolve to the released checksums/digests.
 - Record Chocolatey's moderation state honestly. `choco info tirith` is the
-  source of truth for the approved community package; do not call 0.4.0
-  available there while it is still awaiting moderation.
+  source of truth for the approved community package; do not call the new
+  version available there while it is still awaiting moderation.
 - Run `tirith version --provenance`, `tirith verify-self`, and `tirith doctor`
   from representative package-manager installs and publish the final release
   notes only after those checks match the tag.

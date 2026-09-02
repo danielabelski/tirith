@@ -1,8 +1,10 @@
 # Compatibility and Stability
 
-This matrix describes Tirith 0.4.0. The
-[0.4.0 release notes](release-notes-0.4.0.md) summarize the published
-capabilities, compatibility boundaries, and remaining limitations.
+This matrix describes Tirith 0.4.1. The
+[0.4.1 release notes](release-notes-0.4.1.md) cover what that patch release
+changes, and the [0.4.0 release notes](release-notes-0.4.0.md) summarize the
+0.4 line's published capabilities, compatibility boundaries, and remaining
+limitations.
 
 ## Stability Tiers
 
