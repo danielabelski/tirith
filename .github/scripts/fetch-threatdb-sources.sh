@@ -15,8 +15,8 @@ FINAL_DIR="$OUTPUT_ROOT/tirith-threatdb-sources"
 
 # Reviewed immutable upstream revisions. The workflow mirrors these values and
 # every clone is verified against them before it becomes compiler-visible.
-OSSF_MP_REF=${THREATDB_OSSF_MP_REF:-1ea2762d5fb415aef003a244d5aa83c5fc48cc6e}
-DD_MP_REF=${THREATDB_DD_MP_REF:-ef4a781d476cd6eb89c8517ff9adbb54a5cfa8cc}
+OSSF_MP_REF=${THREATDB_OSSF_MP_REF:-54642f7ee96e780b046660519b028fefb635375a}
+DD_MP_REF=${THREATDB_DD_MP_REF:-2d09839012cedc387ce438debeb77884ac2a242c}
 TYPOSQUAT_REF=${THREATDB_TYPOSQUAT_REF:-fd0bde98d200efe5c282a07edc4c68fba13252c6}
 COMPILER_BIN=${THREATDB_COMPILER_BIN:-./target/release/tirith-threatdb-compile}
 WEB3_ANCHOR_FILE=${THREATDB_WEB3_ANCHOR_FILE:-$REPO_ROOT/crates/tirith/assets/data/web3_package_anchors.csv}
@@ -28,9 +28,9 @@ CURL_CONNECT_TIMEOUT_SECONDS=15
 CURL_MAX_TIME_SECONDS=120
 FEODO_MAX_BYTES=$((16 * 1024 * 1024))
 CISA_KEV_MAX_BYTES=$((64 * 1024 * 1024))
-# The reviewed immutable OpenSSF revision above materializes to 235,293 files
-# and 441,674,789 bytes (verified by the 2026-08-24 main build). Keep bounded
-# headroom for filesystem accounting while still rejecting an unexpected tree.
+# Keep bounded headroom above the reviewed OpenSSF snapshot while still
+# rejecting an unexpectedly large tree. Candidate pin changes exercise these
+# limits before review and publication.
 OSSF_MAX_FILES=250000
 OSSF_MAX_BYTES=$((512 * 1024 * 1024))
 DATADOG_MANIFEST_MAX_BYTES=$((64 * 1024 * 1024))
@@ -68,7 +68,11 @@ mkdir -p -- "$STAGED_SOURCES"
 # input. No source tree can become visible without its exact revisions/hashes.
 PINS_FILE="$STAGED_SOURCES/source-provenance.json"
 
-FETCH_TIMEOUT_SECONDS=${THREATDB_FETCH_TIMEOUT_SECONDS:-180}
+# The reviewed OpenSSF tree contains roughly 200k sparse-materialized advisory
+# files. Keep each network/materialization step bounded, but allow enough time
+# for that tree on a standard Linux runner; the 600s transaction deadline below
+# remains the stricter end-to-end ceiling.
+FETCH_TIMEOUT_SECONDS=${THREATDB_FETCH_TIMEOUT_SECONDS:-300}
 case "$FETCH_TIMEOUT_SECONDS" in
   ''|*[!0-9]*|0*)
     echo "::error::THREATDB_FETCH_TIMEOUT_SECONDS must be a positive integer" >&2
@@ -179,14 +183,13 @@ content_sha256() {
   shift
   (
     cd -- "$root"
-    find "$@" -type f -print0 \
-      | LC_ALL=C sort -z \
-      | while IFS= read -r -d '' file; do
-          printf '%s\0' "$file"
-          sha256sum "$file" | cut -d' ' -f1 | tr -d '\n'
-          printf '\0'
-        done
-  ) | sha256sum | cut -d' ' -f1
+    # Hash every regular file in bytewise path order without spawning two
+    # processes per file. OpenSSF now contains hundreds of thousands of
+    # records, so the former `sha256sum | cut` loop spent minutes creating
+    # nearly half a million subprocesses. `lstat` retains `find -type f`
+    # semantics: symlinks are not followed or included.
+    run_bounded python3 "$SCRIPT_DIR/hash-threatdb-tree.py" "$@"
+  )
 }
 
 run_fetch git clone --depth 1 --filter=blob:none --sparse --no-checkout \
