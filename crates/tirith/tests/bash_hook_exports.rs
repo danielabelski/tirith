@@ -463,6 +463,10 @@ fn doctor_shows_effective_state_when_hook_loaded() {
         stdout.contains("effective protection: blocks"),
         "effective protection missing, got:\n{stdout}"
     );
+    assert!(
+        !stdout.contains("to restore blocking:"),
+        "a live blocking hook must not print degradation recovery guidance, got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -482,6 +486,23 @@ fn doctor_distinguishes_requested_from_effective_on_degrade() {
     assert!(
         stdout.contains("effective protection: warn-only"),
         "effective protection should report the live degraded value, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("to restore blocking:"),
+        "a requested-but-degraded blocking hook must explain how to recover, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn doctor_explains_blocking_when_preexec_has_no_enforcement() {
+    let stdout = doctor_stdout(&[
+        ("TIRITH_BASH_MODE", "preexec"),
+        ("TIRITH_BASH_EFFECTIVE_MODE", "preexec"),
+        ("TIRITH_BASH_EFFECTIVE_PROTECTION", "warn-only"),
+    ]);
+    assert!(
+        stdout.contains("to block on bash:     export TIRITH_BASH_PREEXEC_ENFORCE=1"),
+        "an explicit warn-only preexec session must retain its blocking remedy, got:\n{stdout}"
     );
 }
 

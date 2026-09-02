@@ -315,7 +315,7 @@ If you have your own `DEBUG` trap installed before sourcing the tirith hook, the
 ```
   requested mode:       preexec          ← from TIRITH_BASH_MODE env var
   requested enforce:    off              ← from TIRITH_BASH_PREEXEC_ENFORCE
-  require-enter:        off              ← from TIRITH_BASH_REQUIRE_ENTER
+  require-enter:        off              ← from TIRITH_BASH_REQUIRE_ENTER (reserved; not enforced yet)
   bash mode:            preexec          ← live, exported by the hook
   effective protection: warn-only        ← live, exported by the hook
   safe mode:            off              ← persistent enter-mode-failure flag

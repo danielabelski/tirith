@@ -805,6 +805,27 @@ fn env_is_truthy(s: &str) -> bool {
     )
 }
 
+/// Whether the Bash section should explain how to enable blocking preexec.
+/// Enter mode is available only with a fresh positive self-test. An explicit
+/// or effective preexec mode still needs the guidance even when that cached
+/// Enter verdict is positive.
+fn bash_blocking_remediation_needed(
+    requested_mode: Option<&str>,
+    effective_mode: Option<&str>,
+    enter_capability: Option<&str>,
+    enter_capability_fresh: Option<bool>,
+) -> bool {
+    let preexec_selected = requested_mode
+        .into_iter()
+        .chain(effective_mode)
+        .any(|mode| mode.eq_ignore_ascii_case("preexec"));
+    let enter_is_proven = matches!(
+        (enter_capability, enter_capability_fresh),
+        (Some("works"), Some(true))
+    );
+    preexec_selected || !enter_is_proven
+}
+
 /// True when a persisted bash safe-mode flag is overridden by
 /// `TIRITH_BASH_MODE=enter` (so the hook re-attempts enter mode despite the
 /// recorded failure). Case-sensitive — mirrors the hook's `== "enter"` test.
@@ -2571,7 +2592,13 @@ fn print_human(info: &DoctorInfo) {
         };
         println!("  requested mode:       {requested_mode}");
         println!("  requested enforce:    {requested_enforce}");
-        println!("  require-enter:        {require_enter}");
+        if require_enter == "on" {
+            // Displayed honestly until a hook actually consumes the variable:
+            // nothing enforces require-enter semantics yet.
+            println!("  require-enter:        on (reserved; not enforced by this version)");
+        } else {
+            println!("  require-enter:        {require_enter}");
+        }
 
         match (
             info.bash_effective_mode.as_deref(),
@@ -2617,6 +2644,50 @@ fn print_human(info: &DoctorInfo) {
             }
             None => {
                 println!("  enter capability:     not tested — run tirith doctor --simulate-enter");
+            }
+        }
+        // Enter cannot block here: print the working bash blocking path
+        // (issue #224). Preexec enforcement arms only for shells that START
+        // in preexec mode, so a forced TIRITH_BASH_MODE=enter suppresses it.
+        let blocking_remediation_needed = bash_blocking_remediation_needed(
+            info.bash_requested_mode.as_deref(),
+            info.bash_effective_mode.as_deref(),
+            info.bash_enter_capability.as_deref(),
+            info.bash_enter_capability_fresh,
+        );
+        if blocking_remediation_needed {
+            let forced_enter = info
+                .bash_requested_mode
+                .as_deref()
+                .map(|mode| mode.eq_ignore_ascii_case("enter"))
+                .unwrap_or(false);
+            let enforce_armed = info
+                .bash_requested_enforce
+                .as_deref()
+                .map(env_is_truthy)
+                .unwrap_or(false);
+            let live_enforcement_degraded = enforce_armed
+                && matches!(
+                    info.bash_effective_protection.as_deref(),
+                    Some(protection) if !protection.eq_ignore_ascii_case("blocks")
+                );
+            if forced_enter || !enforce_armed {
+                println!("  to block on bash:     export TIRITH_BASH_PREEXEC_ENFORCE=1 before the");
+                println!(
+                    "                        'eval \"$(tirith init --shell bash)\"' line, then"
+                );
+                println!("                        start a new shell.");
+            } else if live_enforcement_degraded {
+                println!("  to restore blocking:  TIRITH_BASH_PREEXEC_ENFORCE is set, but this");
+                println!(
+                    "                        shell is not blocking. Resolve any hook warning,"
+                );
+                println!("                        then start a new shell.");
+            }
+            if forced_enter {
+                println!("                        Also remove 'export TIRITH_BASH_MODE=enter': it");
+                println!("                        forces the broken enter mode, and preexec");
+                println!("                        enforcement never arms in a forced-enter shell.");
             }
         }
         if safe_mode_overridden_by_env(info.bash_safe_mode, info.bash_requested_mode.as_deref()) {
@@ -3070,6 +3141,28 @@ mod tests {
 
     fn count_named(tools: &[DetectedTool], name: &str) -> usize {
         tools.iter().filter(|t| t.name == name).count()
+    }
+
+    #[test]
+    fn bash_blocking_guidance_requires_a_fresh_working_enter_mode() {
+        assert!(!bash_blocking_remediation_needed(
+            None,
+            Some("enter"),
+            Some("works"),
+            Some(true),
+        ));
+        for (requested, effective, capability, fresh) in [
+            (None, Some("preexec"), Some("works"), Some(true)),
+            (Some("preexec"), None, Some("works"), Some(true)),
+            (None, None, Some("works"), Some(false)),
+            (None, None, Some("broken"), Some(true)),
+            (None, None, None, None),
+        ] {
+            assert!(
+                bash_blocking_remediation_needed(requested, effective, capability, fresh,),
+                "missing, stale, broken, or preexec state must retain blocking guidance"
+            );
+        }
     }
 
     // M13 #132 F2: the shared `check_shell_profile` diagnostic must use the
