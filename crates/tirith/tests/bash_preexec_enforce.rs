@@ -1607,10 +1607,11 @@ echo post_scan_target
 // on enter mode the hook binds `\C-m` then health-checks via `bind -X`, and
 // macOS bash 3.2 does NOT honour `bind -x` here, so the gate degrades to preexec.
 //
-// These tests verify the cache *reader*, not bind-x viability, so the
-// `EFFMODE=<enter>` ones pass `_TIRITH_TEST_SKIP_HEALTH=1` (the test-only gate
-// bypass) to stay green on bash 3.2; real delivery is the PTY harness's job.
-// Preexec-fallback tests (`broken`/`absent`/`stale`) need no override.
+// These tests verify the cache *reader*, not bind-x delivery, so the
+// `EFFMODE=<enter>` ones pass `_TIRITH_TEST_SKIP_HEALTH=1` to bypass the
+// non-PTY health probe. Enter-mode installation still needs Bash 5's `bind -X`
+// enumeration, so those assertions skip Apple Bash 3.2 just like the PTY
+// suite. Preexec-fallback tests (`broken`/`absent`/`stale`) need no override.
 //
 // They also pin the reader against the bash history configs that historically
 // perturbed the hook (HISTCONTROL/HISTIGNORE/HISTTIMEFORMAT/pre-set IFS/extdebug)
@@ -1654,6 +1655,14 @@ fn spawned_bash_major() -> u32 {
         .next()
         .and_then(|major| major.parse().ok())
         .unwrap_or(0)
+}
+
+fn spawned_bash_supports_enter_tests() -> bool {
+    if spawned_bash_major() < 5 {
+        eprintln!("skipping: enter-mode capability assertions require bash >= 5");
+        return false;
+    }
+    true
 }
 
 fn spawned_bash_identity() -> (String, String) {
@@ -1771,8 +1780,11 @@ fn run_hook_with_capability(verdict: Option<&str>, env_vars: &[(&str, &str)]) ->
 
 #[test]
 fn capability_works_cache_selects_enter_mode() {
+    if !spawned_bash_supports_enter_tests() {
+        return;
+    }
     // A fresh `works` verdict selects enter mode. `SKIP_HEALTH` bypasses the
-    // health gate so this holds on any bash (incl. bash 3.2).
+    // non-PTY health gate; installation viability is covered separately.
     let (stdout, _stderr) = run_hook_with_capability(Some("works"), &[SKIP_HEALTH]);
     assert!(
         stdout.contains("EFFMODE=<enter>"),
@@ -1800,6 +1812,9 @@ fn capability_absent_cache_falls_back_to_preexec() {
 
 #[test]
 fn capability_cache_read_survives_hostile_histcontrol() {
+    if !spawned_bash_supports_enter_tests() {
+        return;
+    }
     // HISTCONTROL=ignorespace gates preexec enforcement but must not affect the
     // capability-cache read: a `works` verdict still selects enter.
     let (stdout, _stderr) = run_hook_with_capability(
@@ -1814,6 +1829,9 @@ fn capability_cache_read_survives_hostile_histcontrol() {
 
 #[test]
 fn capability_cache_read_survives_histignore() {
+    if !spawned_bash_supports_enter_tests() {
+        return;
+    }
     let (stdout, _stderr) =
         run_hook_with_capability(Some("works"), &[("HISTIGNORE", "ls:cd:pwd"), SKIP_HEALTH]);
     assert!(
@@ -1824,6 +1842,9 @@ fn capability_cache_read_survives_histignore() {
 
 #[test]
 fn capability_cache_read_survives_histtimeformat_and_preset_ifs() {
+    if !spawned_bash_supports_enter_tests() {
+        return;
+    }
     // The reader sets `IFS` locally per-read, so a pre-set `IFS`/`HISTTIMEFORMAT`
     // must not break its `IFS='='` loop / `wc`.
     let (stdout, _stderr) = run_hook_with_capability(
@@ -1838,6 +1859,9 @@ fn capability_cache_read_survives_histtimeformat_and_preset_ifs() {
 
 #[test]
 fn capability_cache_decision_independent_of_preset_extdebug() {
+    if !spawned_bash_supports_enter_tests() {
+        return;
+    }
     // A user-enabled `extdebug` must not change the decision (passed via BASHOPTS,
     // which bash applies at startup).
     let (stdout, _stderr) =
@@ -1850,6 +1874,9 @@ fn capability_cache_decision_independent_of_preset_extdebug() {
 
 #[test]
 fn capability_cache_read_survives_set_plus_o_history() {
+    if !spawned_bash_supports_enter_tests() {
+        return;
+    }
     // `set +o history` before sourcing must not change the decision — the reader
     // does not touch history. `TempDir` (not `.keep()`) cleans up on return.
     let state = tempfile::tempdir().unwrap();

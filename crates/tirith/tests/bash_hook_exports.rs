@@ -16,6 +16,17 @@
 
 use std::process::Command;
 
+#[path = "pty_support/mod.rs"]
+mod pty_support;
+
+fn bash_under_test() -> std::path::PathBuf {
+    pty_support::modern_bash().unwrap_or_else(|| std::path::PathBuf::from("bash"))
+}
+
+fn enter_mode_supported() -> bool {
+    pty_support::modern_bash().is_some()
+}
+
 fn hook_path() -> String {
     format!(
         "{}/assets/shell/lib/bash-hook.bash",
@@ -60,7 +71,7 @@ fn split_test_env(extra_env: &[(&str, &str)]) -> (String, Vec<(String, String)>)
 /// `Command::new("bash")` reports.
 fn seed_capability_cache(state_dir: &std::path::Path, verdict: &str) {
     let (bash_version, bash_path) = {
-        let out = Command::new("bash")
+        let out = Command::new(bash_under_test())
             .args(["-c", "printf '%s\\n%s' \"$BASH_VERSION\" \"$BASH\""])
             .output()
             .expect("query bash identity");
@@ -120,7 +131,7 @@ fn source_hook_and_dump_exports(capability: Option<&str>, extra_env: &[(&str, &s
     );
 
     // Minimal env so user shell config can't influence results.
-    let mut cmd = Command::new("bash");
+    let mut cmd = Command::new(bash_under_test());
     cmd.args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -140,6 +151,9 @@ fn source_hook_and_dump_exports(capability: Option<&str>, extra_env: &[(&str, &s
 
 #[test]
 fn hook_exports_enter_when_capability_cache_proves_it() {
+    if !enter_mode_supported() {
+        return;
+    }
     // #111: enter mode is the default only with a proven `works` capability.
     // `_TIRITH_TEST_SKIP_HEALTH=1` skips the startup health gate (in a non-PTY
     // `bash -i -c` `bind -x` may not register, degrading enter->preexec); this
@@ -242,7 +256,7 @@ fn hook_does_not_export_in_noninteractive_shell() {
            \"${{TIRITH_STATUS:-unset}}\""
     );
 
-    let out = Command::new("bash")
+    let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -268,7 +282,7 @@ fn hook_does_not_export_in_noninteractive_shell() {
 
 #[test]
 fn failed_builtin_bootstrap_clears_stale_exports_without_calling_shadowed_export() {
-    let version = Command::new("bash")
+    let version = Command::new(bash_under_test())
         .args([
             "--norc",
             "--noprofile",
@@ -296,7 +310,7 @@ fn failed_builtin_bootstrap_clears_stale_exports_without_calling_shadowed_export
          readonly POSIXLY_CORRECT; source "$TIRITH_TEST_HOOK" 2>/dev/null;
          /bin/sh -c 'printf "CHILD_MODE=%s\nCHILD_PROT=%s\n" \
            "$TIRITH_BASH_EFFECTIVE_MODE" "$TIRITH_BASH_EFFECTIVE_PROTECTION"'"#;
-    let output = Command::new("bash")
+    let output = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-c", script])
         .env_clear()
         .env("TIRITH_TEST_HOOK", &hook)
@@ -320,6 +334,9 @@ fn failed_builtin_bootstrap_clears_stale_exports_without_calling_shadowed_export
 
 #[test]
 fn hook_exports_status_blocks_in_enter_mode() {
+    if !enter_mode_supported() {
+        return;
+    }
     // A proven-`works` cache resolves to enter mode (blocks), so the prompt-facing
     // `TIRITH_STATUS` must read `blocks`.
     let out = source_hook_and_dump_exports(Some("works"), &[("_TIRITH_TEST_SKIP_HEALTH", "1")]);
@@ -352,6 +369,9 @@ fn hook_exports_status_off_before_plain_preexec_bootstrap() {
 /// child.
 #[test]
 fn status_is_not_exported_to_child_processes() {
+    if !enter_mode_supported() {
+        return;
+    }
     let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
     let hook = hook_path();
     // Use explicit enter mode with the health gate skipped so the parent has a
@@ -363,7 +383,7 @@ fn status_is_not_exported_to_child_processes() {
          printf 'PARENT=%s\\n' \"${{TIRITH_STATUS:-unset}}\"; \
          bash --norc --noprofile -c 'printf \"CHILD=[%s]\\n\" \"${{TIRITH_STATUS:-}}\"'"
     );
-    let out = Command::new("bash")
+    let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -397,6 +417,9 @@ fn status_is_not_exported_to_child_processes() {
 /// A runtime enter->preexec auto-degrade must flip `TIRITH_STATUS` to `degraded`.
 #[test]
 fn degrade_to_preexec_exports_status_degraded() {
+    if !enter_mode_supported() {
+        return;
+    }
     let out = source_hook_run_and_dump(
         &[("_TIRITH_TEST_SKIP_HEALTH", "1")],
         "_tirith_degrade_to_preexec degrade-test",
@@ -404,6 +427,212 @@ fn degrade_to_preexec_exports_status_degraded() {
     assert!(
         out.contains("STATUS=degraded"),
         "a runtime degrade must set TIRITH_STATUS=degraded, got:\n{out}"
+    );
+}
+
+#[test]
+fn failed_enter_accept_arm_rolls_back_pending_delivery() {
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let token = "a".repeat(64);
+    let script = format!(
+        r#"source '{}'
+_TIRITH_RECEIPT_PROTOCOL=3
+_tirith_enter_arm_accept() {{ return 1; }}
+_tirith_receipt_discard() {{
+  [[ "$1:$2" == "bash-enter:{}" ]] || return 9
+  TIRITH_TEST_DISCARDED=yes
+}}
+_tirith_degrade_to_preexec() {{
+  TIRITH_TEST_DEGRADED="$1"
+  return 0
+}}
+READLINE_LINE=""
+READLINE_POINT=0
+if _tirith_queue_enter_delivery 'printf approved' '{}'; then
+  exit 70
+fi
+printf 'LINE=[%s]\nPOINT=[%s]\nEVAL=[%s]\nCOMMAND=[%s]\nRECEIPT=[%s]\nDISCARDED=[%s]\nDEGRADED=[%s]\n' \
+  "$READLINE_LINE" "$READLINE_POINT" \
+  "${{_TIRITH_PENDING_EVAL+x}}" "${{_TIRITH_PENDING_COMMAND+x}}" \
+  "${{_TIRITH_PENDING_RECEIPT+x}}" "${{TIRITH_TEST_DISCARDED:-}}" \
+  "${{TIRITH_TEST_DEGRADED:-}}"
+"#,
+        hook_path(),
+        token,
+        token
+    );
+    let out = Command::new(bash_under_test())
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .output()
+        .expect("exercise failed guarded-accept arming");
+    assert!(
+        out.status.success(),
+        "arm-failure rollback failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for expected in [
+        "LINE=[printf approved]",
+        "POINT=[15]",
+        "EVAL=[]",
+        "COMMAND=[]",
+        "RECEIPT=[]",
+        "DISCARDED=[yes]",
+        "DEGRADED=[could not arm guarded accept-line]",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} from arm-failure rollback output:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn failed_empty_enter_accept_arm_degrades_visibly() {
+    if !enter_mode_supported() {
+        return;
+    }
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let script = format!(
+        r#"_TIRITH_TEST_SKIP_HEALTH=1
+TIRITH_BASH_MODE=enter
+source '{}' 2>/dev/null
+_tirith_ensure_prompt_hook() {{ return 0; }}
+_tirith_enter_arm_accept() {{ return 1; }}
+_tirith_degrade_to_preexec() {{
+  TIRITH_TEST_DEGRADED="$1"
+  return 0
+}}
+READLINE_LINE=""
+READLINE_POINT=0
+_tirith_enter
+printf 'DEGRADED=[%s]\nLINE=[%s]\nPOINT=[%s]\n' \
+  "${{TIRITH_TEST_DEGRADED:-}}" "$READLINE_LINE" "$READLINE_POINT"
+"#,
+        hook_path()
+    );
+    let out = Command::new(bash_under_test())
+        .args(["--norc", "--noprofile", "-i", "-c", &script])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .output()
+        .expect("exercise failed empty-line guarded-accept arming");
+    assert!(
+        out.status.success(),
+        "empty-line arm failure failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for expected in [
+        "DEGRADED=[could not arm guarded accept-line]",
+        "LINE=[]",
+        "POINT=[0]",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} from empty-line arm failure output:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn failed_accept_disarm_drops_pending_delivery_before_degrading() {
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let token = "b".repeat(64);
+    let script = format!(
+        r#"source '{}'
+_TIRITH_RECEIPT_PROTOCOL=3
+_tirith_enter_disarm_accept() {{ return 1; }}
+_tirith_receipt_discard() {{
+  [[ "$1:$2" == "bash-enter:{}" ]] || return 9
+  TIRITH_TEST_DISCARDED=yes
+}}
+_tirith_degrade_to_preexec() {{
+  TIRITH_TEST_DEGRADED="$1"
+  return 0
+}}
+_TIRITH_PENDING_EVAL='TIRITH_TEST_EVAL_RAN=yes'
+_TIRITH_PENDING_COMMAND='printf approved'
+_TIRITH_PENDING_RECEIPT='{}'
+_tirith_prompt_hook
+printf 'EVAL_RAN=[%s]\nEVAL=[%s]\nCOMMAND=[%s]\nRECEIPT=[%s]\nDISCARDED=[%s]\nDEGRADED=[%s]\n' \
+  "${{TIRITH_TEST_EVAL_RAN:-}}" "${{_TIRITH_PENDING_EVAL+x}}" \
+  "${{_TIRITH_PENDING_COMMAND+x}}" "${{_TIRITH_PENDING_RECEIPT+x}}" \
+  "${{TIRITH_TEST_DISCARDED:-}}" "${{TIRITH_TEST_DEGRADED:-}}"
+"#,
+        hook_path(),
+        token,
+        token
+    );
+    let out = Command::new(bash_under_test())
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .output()
+        .expect("exercise failed guarded-accept disarming");
+    assert!(
+        out.status.success(),
+        "accept-disarm failure failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for expected in [
+        "EVAL_RAN=[]",
+        "EVAL=[]",
+        "COMMAND=[]",
+        "RECEIPT=[]",
+        "DISCARDED=[yes]",
+        "DEGRADED=[could not disarm guarded accept-line]",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} from accept-disarm failure output:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn bind_x_health_matcher_accepts_bash_52_and_53_records() {
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let script = format!(
+        r#"source '{}'
+key='\C-x\C-t7'
+command='_tirith_enter'
+_tirith_bind_x_has_exact_binding '"\C-x\C-t7": "_tirith_enter"' "$key" "$command" || exit 70
+_tirith_bind_x_has_exact_binding '"\C-x\C-t7" "_tirith_enter"' "$key" "$command" || exit 71
+if _tirith_bind_x_has_exact_binding '"\C-x\C-t7": "_tirith_enter_suffix"' "$key" "$command"; then
+  exit 72
+fi
+if _tirith_bind_x_has_exact_binding '"\C-x\C-r7": "_tirith_enter"' "$key" "$command"; then
+  exit 73
+fi
+"#,
+        hook_path()
+    );
+    let out = Command::new(bash_under_test())
+        .args(["--norc", "--noprofile", "-c", &script])
+        .env_clear()
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("PATH", path_with_tirith_under_test())
+        .env("XDG_STATE_HOME", tmpdir.path())
+        .output()
+        .expect("exercise bind-x health matcher");
+    assert!(
+        out.status.success(),
+        "bind-x health matcher failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
     );
 }
 
@@ -423,7 +652,7 @@ fn doctor_stdout(env: &[(&str, &str)]) -> String {
         .collect();
     let bash_script = format!("{}\n'{bin}' doctor", export_lines.join("\n"));
 
-    let out = Command::new("bash")
+    let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-c", &bash_script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -558,7 +787,7 @@ fn source_hook_run_and_dump(extra_env: &[(&str, &str)], body: &str) -> String {
            \"${{TIRITH_STATUS:-}}\""
     );
 
-    let mut cmd = Command::new("bash");
+    let mut cmd = Command::new(bash_under_test());
     cmd.args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
         .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -581,6 +810,9 @@ fn source_hook_run_and_dump(extra_env: &[(&str, &str)], body: &str) -> String {
 /// `enter`/`blocks` values.
 #[test]
 fn degrade_to_preexec_reexports_effective_state() {
+    if !enter_mode_supported() {
+        return;
+    }
     // `_TIRITH_TEST_SKIP_HEALTH=1` keeps the hook in enter mode (else it would
     // auto-degrade at the startup gate, so the explicit degrade below wouldn't
     // be the transition under test).
