@@ -21,7 +21,7 @@ Mozilla Foundation — Public Suffix List
 
 OpenSSF — malicious-packages
   Source: https://github.com/ossf/malicious-packages
-  Pinned revision: 1ea2762d5fb415aef003a244d5aa83c5fc48cc6e
+  Pinned revision: 54642f7ee96e780b046660519b028fefb635375a
   License: Creative Commons Attribution 4.0 (CC-BY-4.0)
   Used for: Confirmed malicious package, artifact, and network records
 
@@ -29,7 +29,7 @@ OpenSSF — malicious-packages
 
 Datadog Security Labs — malicious-software-packages-dataset
   Source: https://github.com/DataDog/malicious-software-packages-dataset
-  Pinned revision: ef4a781d476cd6eb89c8517ff9adbb54a5cfa8cc
+  Pinned revision: 2d09839012cedc387ce438debeb77884ac2a242c
   License: Apache License 2.0 (Apache-2.0)
   Used for: Human-triaged npm and PyPI malicious package manifests
 

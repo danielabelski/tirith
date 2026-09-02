@@ -723,11 +723,11 @@ tirith init --shell fish | source   # in ~/.config/fish/config.fish
 | Shell | Hook type | Tested on |
 |-------|-----------|-----------|
 | zsh | accept-line + paste widgets | 5.8+ |
-| bash | preexec (two modes) | 3.2 compatibility path; 5.0+ for the fully tested modern path |
+| bash | enter-key macro or preexec (two modes) | 3.2 compatibility path; 5.0+ for the fully tested modern path |
 | fish | Enter-key + paste handlers | 3.5+ |
 | PowerShell | PSReadLine handler | 7.0+ |
 
-Bash uses enter mode when a capability self-test has proven it works for your bash, and preexec otherwise. `tirith setup` / `tirith doctor` run the self-test; the shell hook reads its cached verdict at startup. See [troubleshooting](docs/troubleshooting.md#bash-enter-mode-vs-preexec-mode) for details on the modes, the self-test, and SSH fallback behavior.
+Bash uses enter mode when a capability self-test has proven it works for your bash, and preexec otherwise. Since 0.4.1 that self-test passes on stock GNU bash, so enter mode is the ordinary outcome once `tirith setup` or `tirith doctor` has run it; the shell hook reads the cached verdict at startup. See [troubleshooting](docs/troubleshooting.md#bash-enter-mode-vs-preexec-mode) for details on the modes, the self-test, and SSH fallback behavior.
 
 macOS's system Bash 3.2 remains a compatibility path, not the modern blocking
 baseline. Its DEBUG-trap behavior can prevent the trampoline from sticking;
@@ -742,14 +742,14 @@ strict Bash authorization gate is required.
 
 | Shell | Behavior |
 |---|---|
-| bash **enter mode** | **Reliable blocking.** Binds Enter; can stop a command before bash commits to running it. Used by default only where a capability self-test (`tirith doctor --simulate-enter`) has proven `bind -x` delivery works for the running bash. |
+| bash **enter mode** | **Reliable blocking.** Binds Enter to a readline macro that runs the checker and then a guarded accept-line, so a command can be stopped before bash commits to running it. Selected wherever the capability self-test (`tirith doctor --simulate-enter`) has proven delivery and blocking for the running bash, which since 0.4.1 it does on stock GNU bash. A persisted safe-mode flag, an SSH session, or a forced `TIRITH_BASH_MODE=preexec` still selects preexec. |
 | bash **preexec + `TIRITH_BASH_PREEXEC_ENFORCE=1`** | **Conditional blocking.** Scans one trustworthy whole line, then turns on Tirith-owned `extdebug` only for a block and restores it at the next prompt. Existing string/array `PROMPT_COMMAND` entries keep their order and run outside scanning. Enforcement visibly refuses or downgrades when history is filtered or an alias / command substitution / `eval` makes the typed line drift from `BASH_COMMAND`; unsafe prompt/DEBUG ownership or user-owned `extdebug` leaves interception explicitly off rather than mutating user state. |
-| bash **preexec** (no enforce flag) | Warn-only. Prints a DETECTED banner on risky commands; does not block. The fallback when the enter-mode self-test has not proven delivery works. |
+| bash **preexec** (no enforce flag) | Warn-only. Prints a DETECTED banner on risky commands; does not block. The fallback when the enter-mode self-test has not proven delivery works, or when enter mode is otherwise unavailable. |
 | zsh, fish | Reliable blocking in their Enter/accept-line handlers, before the native shell handoff. Notification-only preexec events are not treated as authorization gates. |
 | PowerShell | Reliable PSReadLine preflight blocking; no strict execution receipt. |
 | nushell | Warn-only (does not currently support command interception). |
 
-For guaranteed line-level blocking on bash, run `tirith doctor --simulate-enter`, if delivery works, enter mode is enabled. Where it does not, use preexec enforce for "blocks when possible; tells you honestly when it can't."
+For line-level blocking on bash, run `tirith doctor --simulate-enter`; if delivery works, enter mode is enabled. Where it does not, use preexec enforce for "blocks when possible; tells you honestly when it can't."
 
 Interactive bash, zsh, and fish use a protocol-v3 execution receipt after the
 preflight decision. At hook load, they resolve and pin one absolute Tirith
@@ -801,7 +801,7 @@ tirith version --provenance # version, build info, install method, verification
 **`tirith update`** is package-manager-aware:
 
 - **Package-manager installs** (Homebrew, cargo, npm, Scoop, AUR, apt/dnf) are never self-modified. tirith prints the exact command to run instead, e.g. `brew upgrade tirith`. Updating through the package manager keeps its database consistent.
-- **Self-replaceable installs** (the `install.sh` tarball, a standalone binary, or a securely owned Tirith release cached under `HERMES_HOME`) are updated in place: tirith downloads the latest release, verifies it, then atomically swaps the binary, keeping the previous one as a `tirith.tirith-previous` sidecar. The cosign signature is verified by **default**: if it cannot be verified (cosign missing, or the release published no signature) the update aborts. Pass `--allow-unsigned` to fall back to checksum-only verification; a checksum mismatch always aborts regardless. `tirith update --rollback` reverts to the previous binary; `--dry-run` shows what would happen without changing anything. Updates remain explicit: Tirith never checks for or installs a new binary in the background.
+- **Self-replaceable installs** (the `install.sh` tarball, a standalone binary, or a securely owned Tirith release cached under a Hermes root (`HERMES_HOME`, or `~/.hermes` when that variable is unset; Unix only)) are updated in place: tirith downloads the latest release, verifies it, then atomically swaps the binary, keeping the previous one as a `tirith.tirith-previous` sidecar. The cosign signature is verified by **default**: if it cannot be verified (cosign missing, or the release published no signature) the update aborts. Pass `--allow-unsigned` to fall back to checksum-only verification; a checksum mismatch always aborts regardless. `tirith update --rollback` reverts to the previous binary; `--dry-run` shows what would happen without changing anything. Updates remain explicit: Tirith never checks for or installs a new binary in the background.
 
 > [!NOTE]
 > The install scripts (`scripts/install.sh` and the Windows `install.ps1`) also verify the release's cosign signature by **default** and abort if [`cosign`](https://github.com/sigstore/cosign) is missing or the signature cannot be verified. Install `cosign` first, or set `TIRITH_ALLOW_UNSIGNED=1` to install with checksum-only verification (not recommended). A checksum or signature mismatch always aborts regardless of this opt-out.
@@ -1091,9 +1091,11 @@ use the same grammar as `tirith trust`: a pattern containing `://`, `/`, `?`,
 or `#` is an exact match on the normalized URL (anchored, query and fragment
 significant); a bare dotted host such as `get.docker.com` matches that domain
 and its subdomains; `*.example.com` is an explicit wildcard; a bare token
-without a dot is a substring match against the URL text. Inspect what a policy
-resolves to with `tirith policy effective`, and check a specific command with
-`tirith policy test '<command>'`.
+without a dot is a substring match against the URL text, unless that token is a
+public suffix such as `com` or `dev`, in which case it is treated as a domain
+match against the URL's host and matches every host under it. Inspect what a
+policy resolves to with `tirith policy effective`, and check a specific command
+with `tirith policy test '<command>'`.
 
 ### Managing trust from the CLI
 
@@ -1244,7 +1246,7 @@ Disable: `export TIRITH_LOG=0`
 - [Cookbook](docs/cookbook.md), policy examples for common setups
 - [Troubleshooting](docs/troubleshooting.md), shell quirks, latency, false positives
 - [Compatibility](docs/compatibility.md), stable vs experimental surface
-- [0.4.0 release notes](docs/release-notes-0.4.0.md), release highlights, upgrade notes, limitations, and publication contract
+- [0.4.1 release notes](docs/release-notes-0.4.1.md), what the current patch release changes, and the [0.4.0 release notes](docs/release-notes-0.4.0.md) for the 0.4 line's highlights, limitations, and publication contract
 - [Release checklist](docs/release-checklist.md), protected publication sequence and registry verification
 - [Security policy](SECURITY.md), vulnerability reporting
 - [Uninstall](docs/uninstall.md), clean removal per shell and package manager

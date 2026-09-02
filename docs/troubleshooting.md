@@ -82,8 +82,11 @@ and the pinned Tirith executable identity. Nested shells register independently
 even when they inherit the same session ID. Do not export or manually set any
 `_TIRITH_RECEIPT_*` variable.
 
-If the hook reports that receipts are unavailable, start a fresh shell after
-fixing PATH or upgrading/replacing Tirith. Re-sourcing into the same live shell
+If the hook reports that receipts are unavailable, and a line is printed
+directly under the legacy-mode or degraded-evidence warning, read that line
+first: it is the first line of the registration rejection and it usually names
+the cause. Then start a fresh shell after fixing PATH or upgrading/replacing
+Tirith. Re-sourcing into the same live shell
 process is not a recovery path: duplicate process registration deliberately
 returns no bearer. In particular, an `exec`-replacement shell keeps the same
 PID/start identity but loses the deliberately non-exported bearer, so start a
@@ -98,7 +101,7 @@ compound command executed.
 
 **Who this affects.** zsh and fish. Bash is not affected: on the same failure it
 calls `_tirith_degrade_to_preexec` and keeps working in warn-only mode
-(`shell/lib/bash-hook.bash:1270-1276`). PowerShell has no strict receipt channel
+(`shell/lib/bash-hook.bash:2277-2281`). PowerShell has no strict receipt channel
 and is not affected either.
 
 **Symptom.** Every command you press Enter on is refused with
@@ -127,11 +130,11 @@ runs the tirith binary, and fails closed when that fails. A full or read-only
 `TMPDIR` makes `mktemp` fail, so the block happens without the binary ever being
 consulted.
 
-- zsh: `shell/lib/zsh-hook.zsh:275` and `:315` for the accept-line widget,
-  `:539` and `:556` for the bracketed-paste widget.
-- fish: `_tirith_v3_new_capture_file` (`shell/lib/fish-hook.fish:206-217`)
+- zsh: `shell/lib/zsh-hook.zsh:314` and `:354` for the accept-line widget,
+  `:578` and `:595` for the bracketed-paste widget.
+- fish: `_tirith_v3_new_capture_file` (`shell/lib/fish-hook.fish:198-212`)
   returns 1, and both the protocol-v3 and legacy branches then block
-  (`:403` and `:426`); the paste widget does the same at `:325`. Unlike bash,
+  (`:434` and `:457`); the paste widget does the same at `:356`. Unlike bash,
   fish has no degrade path.
 
 Failing closed is right for an ANALYSIS failure. It is the wrong answer for an
@@ -208,16 +211,19 @@ clearing the command hash does not rebind that running hook.
 ## Bash: Enter mode vs preexec mode
 
 tirith supports two bash integration modes:
-- **enter mode**: Binds to Enter key via `bind -x`. Intercepts commands and paste before execution. Includes startup health gate and runtime self-healing that auto-degrade to preexec if failures are detected.
+- **enter mode**: Binds Enter to a readline macro that runs the checker (a `bind -x` function) and then a guarded accept-line, so the line is accepted only once the checker decides to deliver it. Intercepts commands and paste before execution, and can block. Includes a startup health gate and runtime self-healing that auto-degrade to preexec if failures are detected.
 - **preexec mode**: Uses a phase-aware `DEBUG` trap. Warn-only by default. With `TIRITH_BASH_PREEXEC_ENFORCE=1`, it scans one trustworthy typed line and enables Tirith-owned `extdebug` only when that decision must be blocked.
 
 ### Which mode is used by default
 
-`bind -x` on Enter does not reliably accept the typed line in every bash /
-readline build — in some environments it runs the bound function but never
-returns to the command loop, so the command is silently eaten (issue #111).
-Because this is a property of the bash build, not the version number, tirith
-**proves it** rather than guessing:
+A bare `bind -x` on Enter runs the bound function but does not then accept the
+typed line on stock bash, so the pending command used to be silently eaten
+(issue #111). Enter mode now binds `\C-m` and `\C-j` to a readline macro that
+runs the checker and then a guarded accept-line, which delivers and blocks on
+the stock GNU bash 5.2 and 5.3 builds it was verified against (issue #224).
+Line acceptance is still a property of the specific bash and readline build
+rather than the version number, so tirith keeps **proving it** per build rather
+than guessing:
 
 - `tirith setup` and `tirith doctor` run a quick disposable-PTY **self-test**
   that checks whether enter-mode delivery and blocking actually work for your
@@ -372,7 +378,7 @@ export TIRITH_BASH_MODE=preexec
 eval "$(tirith init --shell bash)"
 ```
 
-This avoids `bind -x` enter interception in environments where PTY handling is fragile.
+This avoids enter-mode readline interception in environments where PTY handling is fragile.
 
 ## PowerShell: PSReadLine conflicts
 

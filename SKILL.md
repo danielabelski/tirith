@@ -408,7 +408,7 @@ Run manually: `tirith mcp-server` (JSON-RPC over stdio)
 | `policy` | Manage security policies (init, validate, test) |
 | `audit` | Export verdicts, stats, and compliance reports |
 | `trust` | Manage trusted patterns with TTL and rule scoping |
-| `receipt` | Manage execution receipts from `tirith run` |
+| `receipt` | Manage download receipts recorded by `tirith run` |
 | `checkpoint` | File checkpoints for rollback before risky operations |
 | `warnings` | Show accumulated session warnings |
 | `threat-db` | Manage threat intelligence database |
