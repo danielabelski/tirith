@@ -348,7 +348,9 @@ pub struct PtySession {
 }
 
 /// How long any single `expect` may wait WITHOUT NEW OUTPUT before failing.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Hook commands spawn the debug `tirith` binary and can be descheduled behind
+/// the other PTY tests for tens of seconds on high-core builders.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// An absolute ceiling on any single `expect`, so a wedged session cannot hang
 /// the suite even though the idle deadline keeps resetting. Generous on
@@ -525,14 +527,22 @@ impl PtySession {
     /// so the caller can assert with a domain message. Use this (not
     /// [`PtySession::wait_idle`]) when waiting on output from a command whose hook
     /// shells out to `tirith` — `wait_idle` would return mid-subprocess (the
-    /// no-output race on [`wait_for_marker`]); this polls patiently.
+    /// no-output race on [`wait_for_marker`]). Like [`PtySession::expect_within`],
+    /// `timeout` is an idle deadline: output progress resets it, while
+    /// [`MAX_TOTAL_WAIT`] still bounds a continuously noisy or wedged session.
     pub fn expect_any(&mut self, needles: &[&str], timeout: Duration) -> String {
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let mut last_progress = started;
+        let mut seen = self.buf.len();
         loop {
             if needles.iter().any(|n| self.buf.contains(n)) {
                 return self.buf.clone();
             }
-            if Instant::now() >= deadline {
+            if self.buf.len() != seen {
+                seen = self.buf.len();
+                last_progress = Instant::now();
+            }
+            if last_progress.elapsed() >= timeout || started.elapsed() >= MAX_TOTAL_WAIT {
                 return self.buf.clone();
             }
             if self.closed && self.rx.try_recv().is_err() {

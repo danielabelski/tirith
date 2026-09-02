@@ -50,6 +50,10 @@ const QUIET: Duration = Duration::from_millis(700);
 /// scheduled often enough to observe quiet inside 12s, so the cap fires while
 /// the shell is merely descheduled.
 const SETTLE_MAX: Duration = Duration::from_secs(60);
+/// Maximum idle gap while a hook subprocess is producing a verdict marker.
+/// This matches the PTY harness's ordinary idle deadline; ten seconds was too
+/// short for concurrent debug-build hook tests on higher-core machines.
+const VERDICT_IDLE: Duration = Duration::from_secs(60);
 /// Hard cap on a side-effect-only command's marker file (no terminal output, so
 /// [`PtySession::wait_idle`] can't time it — poll via [`wait_for_marker`]).
 ///
@@ -854,10 +858,7 @@ fn bash_capability_cache_steers_default_mode() {
             // The `%s` stays literal in the command echo, so waiting for the
             // substituted value never matches the echoed command line.
             sess.send_line("printf 'TIRITHMODE<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"");
-            let out = sess.expect_any(
-                &["TIRITHMODE<enter>", "TIRITHMODE<preexec>"],
-                Duration::from_secs(10),
-            );
+            let out = sess.expect_any(&["TIRITHMODE<enter>", "TIRITHMODE<preexec>"], VERDICT_IDLE);
             sess.close();
             if out.contains("TIRITHMODE<enter>") {
                 "enter".to_string()
@@ -936,10 +937,7 @@ fn bash_enter_mode_delivers_and_blocks() {
     // The `%s` stays literal in the command echo, so waiting for a substituted
     // value never matches the echoed command line.
     sess.send_line("printf 'TIRITHMODE<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"");
-    let mode_out = sess.expect_any(
-        &["TIRITHMODE<enter>", "TIRITHMODE<preexec>"],
-        Duration::from_secs(10),
-    );
+    let mode_out = sess.expect_any(&["TIRITHMODE<enter>", "TIRITHMODE<preexec>"], VERDICT_IDLE);
     assert!(
         mode_out.contains("TIRITHMODE<enter>"),
         "forced enter mode must not degrade at startup, got:\n{mode_out}"
@@ -1049,7 +1047,7 @@ fn bash_enter_degradation_restores_custom_ctrl_o_bindings() {
     sess.send_line("printf 'TIRITH_CTRL_O_MODE<%s>\\n' \"$TIRITH_BASH_EFFECTIVE_MODE\"");
     let mode_output = sess.expect_any(
         &["TIRITH_CTRL_O_MODE<enter>", "TIRITH_CTRL_O_MODE<preexec>"],
-        Duration::from_secs(10),
+        VERDICT_IDLE,
     );
     assert!(
         mode_output.contains("TIRITH_CTRL_O_MODE<enter>"),

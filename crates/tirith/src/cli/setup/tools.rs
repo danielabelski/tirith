@@ -3597,6 +3597,8 @@ fn write_owned_config_with_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::cli::test_harness::ENV_LOCK;
     use crate::cli::test_harness::{with_fake_env, CwdGuard, EnvGuard};
 
     #[cfg(unix)]
@@ -5859,6 +5861,7 @@ mod tests {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
 
         let root = tempfile::tempdir().unwrap();
         let hook = root.path().join("tirith-check.py");
@@ -5905,6 +5908,7 @@ mod tests {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
 
         let root = tempfile::tempdir().unwrap();
         let hook = root.path().join("tirith-check.py");
@@ -6510,6 +6514,7 @@ mod tests {
         // OpenHands injects `additionalContext`.
         use std::io::Write;
         use std::process::{Command, Stdio};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let root = tempfile::tempdir().unwrap();
         let hook = root.path().join("tirith-check.py");
         std::fs::write(&hook, crate::assets::TIRITH_CHECK_PY).unwrap();
@@ -6605,6 +6610,7 @@ mod tests {
     #[test]
     fn cline_run_commands_checks_every_stringified_command_and_shell_dialect() {
         use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let root = tempfile::tempdir().unwrap();
         let fake = root.path().join("fake-tirith");
         let log = root.path().join("calls.log");
@@ -6665,6 +6671,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cline_malformed_batches_fail_closed_and_non_shell_tools_explicitly_allow() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let root = tempfile::tempdir().unwrap();
         let nonexistent = root.path().join("must-not-run");
         let malformed = run_cline_adapter(
@@ -6713,13 +6720,24 @@ mod tests {
 
     /// Resolve a PowerShell interpreter for the end-to-end test. `pwsh` on
     /// POSIX (PowerShell Core), `pwsh-preview` where only the preview cask is
-    /// installed. Returns `None` to skip when none is present.
+    /// installed. Keep the resolved absolute path: other tests temporarily
+    /// replace the process-wide PATH, and a later bare-name spawn would race
+    /// with those changes. Returns `None` to skip when none is present.
     fn powershell_interpreter() -> Option<std::path::PathBuf> {
         use std::process::Command;
+        let path = std::env::var_os("PATH")?;
+        let directories = std::env::split_paths(&path).collect::<Vec<_>>();
+
         for name in ["pwsh", "pwsh-preview"] {
-            if let Ok(output) = Command::new(name).arg("--version").output() {
+            for directory in &directories {
+                let Ok(candidate) = directory.join(name).canonicalize() else {
+                    continue;
+                };
+                let Ok(output) = Command::new(&candidate).arg("--version").output() else {
+                    continue;
+                };
                 if output.status.success() {
-                    return Some(std::path::PathBuf::from(name));
+                    return Some(candidate);
                 }
             }
         }
@@ -6736,6 +6754,7 @@ mod tests {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let Some(pwsh) = powershell_interpreter() else {
             eprintln!("skipping: no PowerShell interpreter (pwsh) available");
             return;
@@ -6826,6 +6845,7 @@ mod tests {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
 
         let Some(pwsh) = powershell_interpreter() else {
             eprintln!("skipping: no PowerShell interpreter (pwsh) available");
@@ -6912,6 +6932,7 @@ mod tests {
         );
         #[cfg(target_os = "linux")]
         {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
             let _path = EnvGuard::set("PATH", Path::new("/nonexistent-bin"));
             assert_eq!(
                 cline_hooks_dir(home.path()),
@@ -6924,6 +6945,7 @@ mod tests {
     #[test]
     fn cline_hooks_dir_refuses_repository_or_temp_xdg_user_dir() {
         use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let home = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let marker = bin.path().join("executed");

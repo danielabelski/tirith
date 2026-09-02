@@ -1298,6 +1298,15 @@ fn validate_unix_owner_and_mode(
     Ok(())
 }
 
+/// Validate that a Unix path's extended ACLs do not widen mutation authority
+/// beyond its trusted owner and the current effective user. Directory checks
+/// include default ACLs because they can affect files created later. Inspection
+/// errors and Unix platforms without a supported ACL reader fail closed.
+#[cfg(unix)]
+pub fn validate_unix_trusted_path_acl(path: &Path, directory: bool) -> Result<(), String> {
+    reject_unix_extended_acl(path, directory)
+}
+
 /// Reject filesystem ACLs that can grant mutation authority independently of
 /// Unix owner/group/mode bits. Resolver tools and their trust store use this
 /// deliberately conservative rule. Linux parses each POSIX ACL xattr (access,

@@ -883,6 +883,10 @@ fn linux_release_keeps_glibc_and_canonical_package_contracts() {
 
     let smoke_path = repository_root.join(".github/scripts/smoke-linux-release.sh");
     let smoke = std::fs::read_to_string(smoke_path).expect("read Linux release smoke script");
+    assert!(
+        smoke.contains("TIRITH_OFFLINE=1"),
+        "release smoke must suppress detached threat-DB refreshes so its isolated state cleanup cannot race a surviving child"
+    );
     for required in [
         "$(uname -m)\" == \"aarch64",
         "capsule run",
